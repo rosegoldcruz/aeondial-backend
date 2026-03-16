@@ -1,0 +1,112 @@
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Org {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users     User[]
+  contacts  Contact[]
+  leads     Lead[]
+  calls     Call[]
+  numbers   PhoneNumber[]
+  campaigns Campaign[]
+}
+
+model User {
+  id        String   @id @default(cuid())
+  org_id    String
+  email     String   @unique
+  name      String?
+  role      String   @default("agent")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  org       Org      @relation(fields: [org_id], references: [id])
+  calls     Call[]
+
+  @@index([org_id])
+}
+
+model Contact {
+  id        String   @id @default(cuid())
+  org_id    String
+  name      String?
+  phone     String
+  email     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  org       Org      @relation(fields: [org_id], references: [id])
+  leads     Lead[]
+  calls     Call[]
+
+  @@index([org_id])
+}
+
+model Lead {
+  id             String   @id @default(cuid())
+  org_id         String
+  status         String   @default("new")
+  source         String?
+  estimatedValue Int?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  contactId      String
+  contact        Contact  @relation(fields: [contactId], references: [id])
+  org            Org      @relation(fields: [org_id], references: [id])
+
+  @@index([org_id])
+}
+
+model Call {
+  id          String    @id @default(cuid())
+  org_id      String
+  direction   String
+  status      String
+  startedAt   DateTime  @default(now())
+  endedAt     DateTime?
+  disposition String?
+
+  userId      String?
+  user        User?     @relation(fields: [userId], references: [id])
+
+  contactId   String?
+  contact     Contact?  @relation(fields: [contactId], references: [id])
+
+  org         Org       @relation(fields: [org_id], references: [id])
+
+  @@index([org_id])
+}
+
+model PhoneNumber {
+  id        String   @id @default(cuid())
+  org_id    String
+  number    String
+  provider  String
+  createdAt DateTime @default(now())
+
+  org       Org      @relation(fields: [org_id], references: [id])
+
+  @@index([org_id])
+}
+
+model Campaign {
+  id        String   @id @default(cuid())
+  org_id    String
+  name      String
+  type      String
+  createdAt DateTime @default(now())
+
+  org       Org      @relation(fields: [org_id], references: [id])
+
+  @@index([org_id])
+}
