@@ -2,8 +2,26 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.aiModule = void 0;
 const supabase_1 = require("../../core/supabase");
+const AI_EVENT_TYPES = [
+    'transcript',
+    'summary',
+    'disposition',
+    'appointment',
+    'transfer',
+    'error',
+];
+const DEFAULT_AI_SETTINGS = {
+    llm_provider: 'openai',
+    tts_provider: 'elevenlabs',
+    stt_provider: 'openai',
+    voice_id: 'default',
+    model_id: 'gpt-4.1-mini',
+};
+function isAiEventType(value) {
+    return typeof value === 'string' && AI_EVENT_TYPES.includes(value);
+}
 const aiModule = async (app) => {
-    app.get('/providers', async (req, reply) => {
+    app.get('/settings', async (req, reply) => {
         const { org_id, campaign_id } = req.query;
         if (!org_id) {
             return reply.status(400).send({ error: 'org_id is required' });
@@ -39,100 +57,41 @@ const aiModule = async (app) => {
             settingsRow = orgRow;
         }
         return reply.send({
-            org_id,
-            campaign_id: campaign_id || null,
-            llm_provider: settingsRow?.llm_provider || 'openai',
-            tts_provider: settingsRow?.tts_provider || 'elevenlabs',
-            stt_provider: settingsRow?.stt_provider || 'openai',
-            voice_id: settingsRow?.voice_id || process.env.ELEVENLABS_VOICE_ID || 'default',
-            model_id: settingsRow?.model_id || process.env.DEFAULT_MODEL_ID || 'gpt-4.1-mini',
+            llm_provider: settingsRow?.llm_provider || DEFAULT_AI_SETTINGS.llm_provider,
+            tts_provider: settingsRow?.tts_provider || DEFAULT_AI_SETTINGS.tts_provider,
+            stt_provider: settingsRow?.stt_provider || DEFAULT_AI_SETTINGS.stt_provider,
+            voice_id: settingsRow?.voice_id || DEFAULT_AI_SETTINGS.voice_id,
+            model_id: settingsRow?.model_id || DEFAULT_AI_SETTINGS.model_id,
         });
     });
     app.post('/events', async (req, reply) => {
         const body = (req.body || {});
-        if (!body.org_id || !body.campaign_id || !body.type) {
+        if (!body.org_id || !body.type) {
             return reply
                 .status(400)
-                .send({ error: 'org_id, campaign_id, and type are required' });
+                .send({ error: 'org_id and type are required' });
         }
         if (!req.org_id || req.org_id !== body.org_id) {
             return reply.status(403).send({ error: 'Cross-tenant access denied' });
         }
+        if (!isAiEventType(body.type)) {
+            return reply.status(400).send({ error: 'Unsupported AI event type' });
+        }
+        const actorId = req.user_id || body.agent_id || 'ai-worker';
         const { data, error } = await supabase_1.supabase
             .from('ai_events')
             .insert({
             ai_event_id: crypto.randomUUID(),
             org_id: body.org_id,
-            campaign_id: body.campaign_id,
+            campaign_id: body.campaign_id || null,
             call_id: body.call_id || null,
             event_type: body.type,
-            payload: body.payload || {},
-            created_by: req.user_id,
-            updated_by: req.user_id,
-        })
-            .select('*')
-            .single();
-        if (error) {
-            return reply.status(500).send({ error: error.message });
-        }
-        return reply.send({ success: true, event: data });
-    });
-    app.post('/summary', async (req, reply) => {
-        const body = (req.body || {});
-        if (!body.org_id || !body.campaign_id || !body.summary) {
-            return reply
-                .status(400)
-                .send({ error: 'org_id, campaign_id, and summary are required' });
-        }
-        if (!req.org_id || req.org_id !== body.org_id) {
-            return reply.status(403).send({ error: 'Cross-tenant access denied' });
-        }
-        const { data, error } = await supabase_1.supabase
-            .from('ai_events')
-            .insert({
-            ai_event_id: crypto.randomUUID(),
-            org_id: body.org_id,
-            campaign_id: body.campaign_id,
-            call_id: body.call_id || null,
-            event_type: 'summary',
             payload: {
-                summary: body.summary,
-                ...(body.metadata || {}),
+                agent_id: body.agent_id || actorId,
+                ...(body.payload || {}),
             },
-            created_by: req.user_id,
-            updated_by: req.user_id,
-        })
-            .select('*')
-            .single();
-        if (error) {
-            return reply.status(500).send({ error: error.message });
-        }
-        return reply.send({ success: true, event: data });
-    });
-    app.post('/transcript', async (req, reply) => {
-        const body = (req.body || {});
-        if (!body.org_id || !body.campaign_id || !body.transcript) {
-            return reply
-                .status(400)
-                .send({ error: 'org_id, campaign_id, and transcript are required' });
-        }
-        if (!req.org_id || req.org_id !== body.org_id) {
-            return reply.status(403).send({ error: 'Cross-tenant access denied' });
-        }
-        const { data, error } = await supabase_1.supabase
-            .from('ai_events')
-            .insert({
-            ai_event_id: crypto.randomUUID(),
-            org_id: body.org_id,
-            campaign_id: body.campaign_id,
-            call_id: body.call_id || null,
-            event_type: 'transcript',
-            payload: {
-                transcript: body.transcript,
-                ...(body.metadata || {}),
-            },
-            created_by: req.user_id,
-            updated_by: req.user_id,
+            created_by: actorId,
+            updated_by: actorId,
         })
             .select('*')
             .single();

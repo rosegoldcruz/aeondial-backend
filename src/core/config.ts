@@ -9,6 +9,11 @@ export const config = {
   redisUrl: process.env.REDIS_URL || 'redis://127.0.0.1:6379',
   crmOrigin: process.env.CRM_ORIGIN || 'http://localhost:3000',
   aiWorkerOrigin: process.env.AI_WORKER_ORIGIN || 'http://localhost:8787',
+  ariUrl: process.env.ARI_URL || '',
+  ariUsername: process.env.ARI_USERNAME || '',
+  ariPassword: process.env.ARI_PASSWORD || '',
+  ariApp: process.env.ARI_APP || 'aeondial',
+  ariEndpointPrefix: process.env.ARI_ENDPOINT_PREFIX || 'PJSIP',
 };
 
 export function assertRequiredConfig(): void {

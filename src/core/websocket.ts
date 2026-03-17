@@ -5,13 +5,22 @@ type PresenceState = {
   status: 'online' | 'away' | 'busy' | 'offline';
 };
 
-type WsEnvelope = {
-  type:
-    | 'agent.presence'
-    | 'call.event'
-    | 'queue.metrics'
-    | 'ai.whisper'
-    | 'supervisor.control';
+export type WsEventType =
+  | 'agent.presence'
+  | 'agent.state'          // agent FSM transition: READY / INCALL / WRAP …
+  | 'call.event'
+  | 'call.amd_result'      // AMD detection result for a call
+  | 'call.bridged'         // agent + lead channels joined
+  | 'call.wrap'            // call ended, wrap timer started
+  | 'queue.metrics'
+  | 'queue.lead_dialing'   // dialer picked a lead and is dialling it
+  | 'queue.lead_answered'  // lead answered (post-AMD human)
+  | 'queue.lead_abandoned' // lead was abandoned (no agent available)
+  | 'ai.whisper'
+  | 'supervisor.control';
+
+export type WsEnvelope = {
+  type: WsEventType;
   org_id: string;
   campaign_id?: string;
   payload?: Record<string, unknown>;
@@ -30,6 +39,10 @@ function emitToOrg(org_id: string, event: WsEnvelope) {
       socket.send(message);
     }
   }
+}
+
+export function emitOrgEvent(event: WsEnvelope): void {
+  emitToOrg(event.org_id, event);
 }
 
 export const websocketPlugin: FastifyPluginAsync = async (app) => {
@@ -102,8 +115,15 @@ export const websocketPlugin: FastifyPluginAsync = async (app) => {
           return;
         }
 
+        case 'agent.state':
         case 'call.event':
+        case 'call.amd_result':
+        case 'call.bridged':
+        case 'call.wrap':
         case 'queue.metrics':
+        case 'queue.lead_dialing':
+        case 'queue.lead_answered':
+        case 'queue.lead_abandoned':
         case 'ai.whisper':
         case 'supervisor.control': {
           emitToOrg(org_id, {

@@ -16,6 +16,7 @@ import { campaignsModule } from './modules/campaigns';
 import { telephonyModule } from './modules/telephony';
 import { aiModule } from './modules/ai';
 import { automationsModule } from './modules/automations';
+import { dialerModule } from './modules/dialer';
 
 async function buildServer() {
   assertRequiredConfig();
@@ -49,6 +50,7 @@ async function buildServer() {
   await app.register(telephonyModule, { prefix: '/telephony' });
   await app.register(aiModule, { prefix: '/ai' });
   await app.register(automationsModule, { prefix: '/automations' });
+  await app.register(dialerModule, { prefix: '/dialer' });
 
   return app;
 }
