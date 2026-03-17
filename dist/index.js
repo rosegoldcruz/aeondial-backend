@@ -9,6 +9,7 @@ const helmet_1 = __importDefault(require("@fastify/helmet"));
 const websocket_1 = __importDefault(require("@fastify/websocket"));
 const config_1 = require("./core/config");
 const logger_1 = require("./core/logger");
+const redis_1 = require("./core/redis");
 const auth_1 = require("./core/auth");
 const websocket_2 = require("./core/websocket");
 const orgs_1 = require("./modules/orgs");
@@ -50,6 +51,7 @@ async function buildServer() {
 }
 buildServer()
     .then(async (app) => {
+    (0, redis_1.startBackgroundWorkers)();
     await app.listen({ port: config_1.config.port, host: '0.0.0.0' });
 })
     .catch((error) => {

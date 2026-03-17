@@ -4,6 +4,7 @@ import helmet from '@fastify/helmet';
 import websocket from '@fastify/websocket';
 import { config, assertRequiredConfig } from './core/config';
 import { logger } from './core/logger';
+import { startBackgroundWorkers } from './core/redis';
 import { authPlugin, requireTenantContext } from './core/auth';
 import { websocketPlugin } from './core/websocket';
 import { orgsModule } from './modules/orgs';
@@ -54,6 +55,7 @@ async function buildServer() {
 
 buildServer()
   .then(async (app) => {
+    startBackgroundWorkers();
     await app.listen({ port: config.port, host: '0.0.0.0' });
   })
   .catch((error) => {

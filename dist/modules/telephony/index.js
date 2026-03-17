@@ -20,6 +20,36 @@ const telephonyModule = async (app) => {
         user_id: req.user_id,
         role: req.role,
     }));
+    app.get('/calls', async (req, reply) => {
+        const { org_id, campaign_id, status, limit } = req.query;
+        if (!req.org_id) {
+            return reply.status(401).send({ error: 'Missing org scope' });
+        }
+        if (!org_id) {
+            return reply.status(400).send({ error: 'org_id is required' });
+        }
+        if (org_id !== req.org_id) {
+            return reply.status(403).send({ error: 'Cross-tenant access denied' });
+        }
+        let query = supabase_1.supabase.from('calls').select('*').eq('org_id', req.org_id);
+        if (campaign_id) {
+            query = query.eq('campaign_id', campaign_id);
+        }
+        if (status) {
+            query = query.eq('status', status);
+        }
+        const parsedLimit = Number.parseInt(limit || '100', 10);
+        const safeLimit = Number.isFinite(parsedLimit)
+            ? Math.min(Math.max(parsedLimit, 1), 500)
+            : 100;
+        const { data, error } = await query
+            .order('created_at', { ascending: false })
+            .limit(safeLimit);
+        if (error) {
+            return reply.status(500).send({ error: error.message });
+        }
+        return reply.send(data || []);
+    });
     app.post('/calls/originate', async (req, reply) => {
         const body = (req.body || {});
         const validationError = validateRequiredCallScope(body);
