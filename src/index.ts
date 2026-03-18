@@ -30,7 +30,7 @@ const app = Fastify({ logger: true });
   });
   await app.register(helmet);
   await app.register(websocket);
-  await app.register(authPlugin);
+  await authPlugin(app, {});
 
   app.addHook('preHandler', requireTenantContext);
 

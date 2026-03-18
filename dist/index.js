@@ -32,7 +32,7 @@ async function buildServer() {
     });
     await app.register(helmet_1.default);
     await app.register(websocket_1.default);
-    await app.register(auth_1.authPlugin);
+    await (0, auth_1.authPlugin)(app, {});
     app.addHook('preHandler', auth_1.requireTenantContext);
     await app.register(websocket_2.websocketPlugin);
     app.get('/health', async () => ({ ok: true }));

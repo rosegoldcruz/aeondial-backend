@@ -70,7 +70,23 @@ const dialerModule = async (app) => {
         if (!req.user_id) {
             return reply.status(401).send({ error: 'Missing user scope' });
         }
-        const { data: user, error } = await supabase_1.supabase
+        const headerEmail = req.headers['x-user-email'];
+        const headerName = req.headers['x-user-name'];
+        const headerEndpoint = req.headers['x-softphone-endpoint'];
+        const headerTransport = req.headers['x-softphone-transport'];
+        const headerHost = req.headers['x-softphone-host'];
+        const desiredSoftphone = {
+            endpoint: typeof headerEndpoint === 'string' && headerEndpoint.trim()
+                ? headerEndpoint.trim()
+                : config_1.config.dialerDefaultAgentEndpoint || null,
+            transport: typeof headerTransport === 'string' && headerTransport.trim()
+                ? headerTransport.trim()
+                : config_1.config.dialerDefaultAgentTransport,
+            host: typeof headerHost === 'string' && headerHost.trim()
+                ? headerHost.trim()
+                : config_1.config.dialerDefaultAgentHost || null,
+        };
+        let { data: user, error } = await supabase_1.supabase
             .from('users')
             .select('user_id, full_name, metadata')
             .eq('user_id', req.user_id)
@@ -78,6 +94,37 @@ const dialerModule = async (app) => {
             .maybeSingle();
         if (error)
             return reply.status(500).send({ error: error.message });
+        if (!user) {
+            const bootstrapEmail = typeof headerEmail === 'string' && headerEmail.trim()
+                ? headerEmail.trim().toLowerCase()
+                : `${req.user_id}@clerk.local`;
+            const bootstrapName = typeof headerName === 'string' && headerName.trim()
+                ? headerName.trim()
+                : null;
+            const { data: seededUser, error: seedError } = await supabase_1.supabase
+                .from('users')
+                .upsert({
+                user_id: req.user_id,
+                org_id: orgId,
+                email: bootstrapEmail,
+                full_name: bootstrapName,
+                role: 'agent',
+                status: 'active',
+                metadata: {
+                    softphone: desiredSoftphone,
+                    identity_provider: 'clerk',
+                },
+                created_by: req.user_id,
+                updated_by: req.user_id,
+                updated_at: new Date().toISOString(),
+            }, { onConflict: 'user_id' })
+                .select('user_id, full_name, metadata')
+                .maybeSingle();
+            if (seedError) {
+                logger_1.logger.error({ err: seedError, org_id: orgId, user_id: req.user_id }, 'Failed to bootstrap Clerk-linked user');
+            }
+            user = seededUser || null;
+        }
         if (!user) {
             const fallbackEndpoint = config_1.config.dialerDefaultAgentEndpoint || null;
             return reply.send({
@@ -97,7 +144,35 @@ const dialerModule = async (app) => {
                     : {},
             });
         }
-        const metadata = (user.metadata || {});
+        let metadata = (user.metadata || {});
+        const currentSoftphone = (metadata.softphone || {});
+        const currentEndpoint = typeof currentSoftphone.endpoint === 'string' ? currentSoftphone.endpoint.trim() : '';
+        if (!currentEndpoint && desiredSoftphone.endpoint) {
+            const mergedMetadata = {
+                ...metadata,
+                softphone: {
+                    ...currentSoftphone,
+                    endpoint: desiredSoftphone.endpoint,
+                    transport: currentSoftphone.transport || desiredSoftphone.transport,
+                    host: currentSoftphone.host || desiredSoftphone.host,
+                },
+            };
+            const { data: updatedUser, error: updateError } = await supabase_1.supabase
+                .from('users')
+                .update({
+                metadata: mergedMetadata,
+                updated_by: req.user_id,
+                updated_at: new Date().toISOString(),
+            })
+                .eq('user_id', req.user_id)
+                .eq('org_id', orgId)
+                .select('user_id, full_name, metadata')
+                .maybeSingle();
+            if (!updateError && updatedUser) {
+                user = updatedUser;
+                metadata = (updatedUser.metadata || {});
+            }
+        }
         const softphone = (metadata.softphone || {});
         const fallbackEndpoint = (typeof softphone.endpoint === 'string' && softphone.endpoint.trim()) ? softphone.endpoint : config_1.config.dialerDefaultAgentEndpoint || null;
         return reply.send({
