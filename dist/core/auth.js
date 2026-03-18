@@ -48,6 +48,12 @@ const authPlugin = async (app) => {
 exports.authPlugin = authPlugin;
 const PUBLIC_PATHS = new Set(['/health', '/version', '/ws']);
 const VALID_ROLES = new Set(['owner', 'admin', 'agent']);
+const AGENT_WRITE_ALLOWLIST = [
+    /^\/dialer\/agents\/session$/,
+    /^\/dialer\/agents\/[^/]+\/state$/,
+    /^\/dialer\/calls\/[^/]+\/disposition$/,
+    /^\/telephony\/calls\/end$/,
+];
 function extractScopedOrgId(req) {
     const query = (req.query || {});
     const body = (req.body || {});
@@ -66,6 +72,9 @@ function extractScopedOrgId(req) {
 function isWriteMethod(method) {
     return method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
 }
+function isAgentWriteAllowed(path) {
+    return AGENT_WRITE_ALLOWLIST.some((pattern) => pattern.test(path));
+}
 async function requireTenantContext(req, reply) {
     const path = req.url.split('?')[0];
     if (PUBLIC_PATHS.has(path)) {
@@ -81,8 +90,10 @@ async function requireTenantContext(req, reply) {
     }
     // Enforce role-based write restrictions.
     if (isWriteMethod(req.method) && req.role === 'agent' && !path.startsWith('/ai')) {
-        await reply.status(403).send({ error: 'Agent role cannot perform write operations on this resource' });
-        return;
+        if (!isAgentWriteAllowed(path)) {
+            await reply.status(403).send({ error: 'Agent role cannot perform write operations on this resource' });
+            return;
+        }
     }
     // Validate org exists in Supabase.
     const { data: org, error } = await supabase_1.supabase

@@ -5,7 +5,7 @@
  * ─────────────────
  * Asterisk's built-in AMD() dialplan app runs during call setup.
  * The dialplan posts results here via:
- *   CURL(${BACKEND_URL}/telephony/calls/${call_id}/amd_result, ...)
+ *   CURL(${BACKEND_URL}/dialer/calls/${call_id}/amd_result, ...)
  *
  * This module:
  *   1. Validates and persists the AMD result to `call_events`.
@@ -37,7 +37,7 @@ export interface AmdClassification {
 
 /**
  * Persist an AMD result and broadcast it over WebSocket.
- * Called from the `POST /telephony/calls/:id/amd_result` route.
+ * Called from the `POST /dialer/calls/:id/amd_result` route.
  */
 export async function recordAmdResult(classification: AmdClassification): Promise<void> {
   const { call_id, org_id, result, cause, duration_ms } = classification;

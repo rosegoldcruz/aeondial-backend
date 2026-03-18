@@ -60,6 +60,12 @@ export const authPlugin: FastifyPluginAsync = async (app) => {
 
 const PUBLIC_PATHS = new Set(['/health', '/version', '/ws']);
 const VALID_ROLES = new Set<Role>(['owner', 'admin', 'agent']);
+const AGENT_WRITE_ALLOWLIST = [
+  /^\/dialer\/agents\/session$/,
+  /^\/dialer\/agents\/[^/]+\/state$/,
+  /^\/dialer\/calls\/[^/]+\/disposition$/,
+  /^\/telephony\/calls\/end$/,
+];
 
 function extractScopedOrgId(req: FastifyRequest): string | undefined {
   const query = (req.query || {}) as Record<string, unknown>;
@@ -83,6 +89,10 @@ function isWriteMethod(method: string): boolean {
   return method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
 }
 
+function isAgentWriteAllowed(path: string): boolean {
+  return AGENT_WRITE_ALLOWLIST.some((pattern) => pattern.test(path));
+}
+
 export async function requireTenantContext(
   req: FastifyRequest,
   reply: FastifyReply,
@@ -104,8 +114,10 @@ export async function requireTenantContext(
 
   // Enforce role-based write restrictions.
   if (isWriteMethod(req.method) && req.role === 'agent' && !path.startsWith('/ai')) {
-    await reply.status(403).send({ error: 'Agent role cannot perform write operations on this resource' });
-    return;
+    if (!isAgentWriteAllowed(path)) {
+      await reply.status(403).send({ error: 'Agent role cannot perform write operations on this resource' });
+      return;
+    }
   }
 
   // Validate org exists in Supabase.

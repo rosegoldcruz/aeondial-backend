@@ -8,10 +8,8 @@ const campaignsModule = async (app) => {
         if (!req.org_id) {
             return reply.status(401).send({ error: 'Missing org scope' });
         }
-        if (!org_id) {
-            return reply.status(400).send({ error: 'org_id is required' });
-        }
-        if (org_id !== req.org_id) {
+        const scopedOrgId = org_id || req.org_id;
+        if (scopedOrgId !== req.org_id) {
             return reply.status(403).send({ error: 'Cross-tenant access denied' });
         }
         let query = supabase_1.supabase.from('campaigns').select('*').eq('org_id', req.org_id);

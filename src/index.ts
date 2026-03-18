@@ -5,6 +5,7 @@ import websocket from '@fastify/websocket';
 import { config, assertRequiredConfig } from './core/config';
 import { logger } from './core/logger';
 import { startBackgroundWorkers } from './core/redis';
+import { startAriEventService } from './core/ariEvents';
 import { authPlugin, requireTenantContext } from './core/auth';
 import { websocketPlugin } from './core/websocket';
 import { orgsModule } from './modules/orgs';
@@ -21,7 +22,7 @@ import { dialerModule } from './modules/dialer';
 async function buildServer() {
   assertRequiredConfig();
 
-  const app = Fastify({ logger });
+const app = Fastify({ logger: true });
 
   await app.register(cors, {
     origin: [config.crmOrigin, config.aiWorkerOrigin],
@@ -58,6 +59,7 @@ async function buildServer() {
 buildServer()
   .then(async (app) => {
     startBackgroundWorkers();
+    startAriEventService();
     await app.listen({ port: config.port, host: '0.0.0.0' });
   })
   .catch((error) => {

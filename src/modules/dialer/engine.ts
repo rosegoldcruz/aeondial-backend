@@ -26,11 +26,11 @@ import { Queue, Worker, Job } from 'bullmq';
 import { bullConnection } from '../../core/redis';
 import { supabase } from '../../core/supabase';
 import { ARI, AriRequestError } from '../../core/ari';
-import { config } from '../../core/config';
 import { emitOrgEvent } from '../../core/websocket';
 import { logger } from '../../core/logger';
 import { reserveNextAgent, transitionAgentState } from './agentState';
-import { amdDispatchAction } from './amd';
+import { buildDialerCallMetadata, resolveOutboundEndpoint } from './orchestrator';
+import { getDialerCall, transitionDialerCallState } from './callState';
 
 export interface DialerJobData {
   org_id: string;
@@ -108,7 +108,7 @@ export async function seedDialerQueue(
       lead_id: lead.lead_id,
       cl_id: lead.cl_id,
       direction: 'outbound',
-      status: 'queued',
+      status: 'QUEUED',
       created_by: 'dialer',
       updated_by: 'dialer',
     });
@@ -222,7 +222,14 @@ async function processDialerJob(job: Job<DialerJobData>): Promise<void> {
   if (!session) {
     // No agent available: return lead to pending and emit queue metric
     await releaseCampaignLead(cl_id, org_id, 'pending');
-    await updateCallStatus(call_id, org_id, 'abandoned', { reason: 'no_agent' });
+    const abandonedCall = await getDialerCall(call_id, org_id);
+    if (abandonedCall) {
+      await transitionDialerCallState(abandonedCall, 'ABANDONED', {
+        eventType: 'queue.lead_abandoned',
+        metadataPatch: { abandon_reason: 'no_agent' },
+        eventPayload: { reason: 'no_agent' },
+      }).catch(() => undefined);
+    }
 
     emitOrgEvent({
       type: 'queue.lead_abandoned',
@@ -247,19 +254,40 @@ async function processDialerJob(job: Job<DialerJobData>): Promise<void> {
   });
 
   // 2. Resolve outbound endpoint
-  const endpoint = `${config.ariEndpointPrefix}/${phone.replace(/^\+/, '')}`;
+  const endpoint = resolveOutboundEndpoint(phone);
+  const leadSnapshot = await resolveLeadSnapshot(org_id, contact_id, lead_id);
 
   // Update call row with assigned agent
-  await supabase
-    .from('calls')
-    .update({
-      status: 'dialing',
+  const queuedCall = await getDialerCall(call_id, org_id);
+  if (!queuedCall) {
+    await releaseCampaignLead(cl_id, org_id, 'pending');
+    await transitionAgentState(sessionId, org_id, 'READY', { reason: 'call_missing' });
+    return;
+  }
+
+  await transitionDialerCallState(queuedCall, 'DIALING_LEAD', {
+    eventType: 'queue.lead_dialing',
+    metadataPatch: buildDialerCallMetadata({
+      session_id: sessionId,
+      agent_id: agentId,
+      endpoint,
+      attempt,
+      cl_id,
+      phone,
+      lead_name: leadSnapshot.lead_name,
+      contact_name: leadSnapshot.contact_name,
+    }),
+    extraUpdates: {
       assigned_agent: agentId,
-      metadata: { agent_id: agentId, session_id: sessionId, endpoint, attempt },
-      updated_at: new Date().toISOString(),
-    })
-    .eq('call_id', call_id)
-    .eq('org_id', org_id);
+    },
+    eventPayload: {
+      phone,
+      agent_id: agentId,
+      session_id: sessionId,
+      attempt,
+      cl_id,
+    },
+  });
 
   // Update campaign_lead attempts and last_called_at
   await supabase
@@ -288,8 +316,9 @@ async function processDialerJob(job: Job<DialerJobData>): Promise<void> {
         DIALER_ORG_ID: org_id,
         DIALER_CAMPAIGN_ID: campaign_id,
         DIALER_CL_ID: cl_id,
-        DIALER_BACKEND_URL: process.env.BACKEND_INTERNAL_URL ?? `http://localhost:${config.port}`,
+        DIALER_BACKEND_URL: process.env.BACKEND_INTERNAL_URL ?? 'http://localhost:4000',
         AMD_ENABLED: '1',
+        DIALER_CHANNEL_ROLE: 'lead',
       },
     }) as { id: string } | undefined;
 
@@ -298,21 +327,21 @@ async function processDialerJob(job: Job<DialerJobData>): Promise<void> {
         ? ariChannel.id
         : call_id;
 
-    await supabase
-      .from('calls')
-      .update({
-        status: 'originated',
-        metadata: {
-          agent_id: agentId,
-          session_id: sessionId,
-          endpoint,
+    const dialingCall = await getDialerCall(call_id, org_id);
+    if (dialingCall) {
+      await transitionDialerCallState(dialingCall, 'DIALING_LEAD', {
+        allowSameState: true,
+        eventType: 'lead.originated',
+        metadataPatch: {
+          lead_channel_id: ariChannelId,
           ari_channel_id: ariChannelId,
-          attempt,
         },
-        updated_at: new Date().toISOString(),
-      })
-      .eq('call_id', call_id)
-      .eq('org_id', org_id);
+        eventPayload: {
+          ari_channel_id: ariChannelId,
+          endpoint,
+        },
+      });
+    }
   } catch (err) {
     // ARI originate failed
     const errPayload =
@@ -320,7 +349,14 @@ async function processDialerJob(job: Job<DialerJobData>): Promise<void> {
         ? { message: err.message, status: err.status, response: err.responseText }
         : { message: err instanceof Error ? err.message : String(err) };
 
-    await updateCallStatus(call_id, org_id, 'failed', { ari_error: errPayload });
+    const currentCall = await getDialerCall(call_id, org_id);
+    if (currentCall) {
+      await transitionDialerCallState(currentCall, 'FAILED', {
+        eventType: 'lead.originate_failed',
+        metadataPatch: { ari_error: errPayload },
+        eventPayload: { ari_error: errPayload },
+      }).catch(() => undefined);
+    }
     await releaseCampaignLead(cl_id, org_id, 'failed');
     await transitionAgentState(sessionId, org_id, 'READY', { reason: 'originate_failed' });
 
@@ -328,8 +364,8 @@ async function processDialerJob(job: Job<DialerJobData>): Promise<void> {
     return;
   }
 
-  // 4. The AMD result arrives asynchronously via POST /telephony/calls/:id/amd_result.
-  //    The agent bridging and INCALL transition happen inside processAmdResult() in index.ts.
+  // 4. The lead channel now waits in Stasis. The ARI event loop will continue the
+  //    answered lead into dialplan AMD, then drive beep/bridge/wrap from there.
   //    This job completes here; further call handling is event-driven.
   logger.info(
     { org_id, campaign_id, cl_id, call_id, ari_channel_id: ariChannelId, agent_id: agentId },
@@ -354,23 +390,6 @@ async function releaseCampaignLead(
     .eq('org_id', orgId);
 }
 
-async function updateCallStatus(
-  callId: string,
-  orgId: string,
-  status: string,
-  metadata: Record<string, unknown> = {},
-): Promise<void> {
-  await supabase
-    .from('calls')
-    .update({
-      status,
-      metadata,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('call_id', callId)
-    .eq('org_id', orgId);
-}
-
 async function resolveCallerId(orgId: string, campaignId: string): Promise<string | undefined> {
   const { data } = await supabase
     .from('phone_numbers')
@@ -382,4 +401,38 @@ async function resolveCallerId(orgId: string, campaignId: string): Promise<strin
     .maybeSingle();
 
   return data?.e164 ?? undefined;
+}
+
+async function resolveLeadSnapshot(
+  orgId: string,
+  contactId: string | null,
+  leadId: string,
+): Promise<{ lead_name: string | null; contact_name: string | null }> {
+  let contactName: string | null = null;
+  if (contactId) {
+    const { data: contact } = await supabase
+      .from('contacts')
+      .select('first_name, last_name')
+      .eq('contact_id', contactId)
+      .eq('org_id', orgId)
+      .maybeSingle();
+
+    contactName = [contact?.first_name, contact?.last_name].filter(Boolean).join(' ').trim() || null;
+  }
+
+  const { data: lead } = await supabase
+    .from('leads')
+    .select('metadata')
+    .eq('lead_id', leadId)
+    .eq('org_id', orgId)
+    .maybeSingle();
+
+  const leadMeta = (lead?.metadata || {}) as Record<string, unknown>;
+  const leadNameValue = leadMeta.lead_name ?? leadMeta.name;
+  const leadName = typeof leadNameValue === 'string' && leadNameValue.trim() ? leadNameValue : null;
+
+  return {
+    lead_name: leadName,
+    contact_name: contactName,
+  };
 }

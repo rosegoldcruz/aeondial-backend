@@ -1,6 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.websocketPlugin = void 0;
+exports.emitOrgEvent = emitOrgEvent;
 const orgSockets = new Map();
 const orgPresence = new Map();
 function emitToOrg(org_id, event) {
@@ -13,6 +14,9 @@ function emitToOrg(org_id, event) {
             socket.send(message);
         }
     }
+}
+function emitOrgEvent(event) {
+    emitToOrg(event.org_id, event);
 }
 const websocketPlugin = async (app) => {
     app.get('/ws', { websocket: true }, (socket, req) => {
@@ -73,8 +77,16 @@ const websocketPlugin = async (app) => {
                     });
                     return;
                 }
+                case 'agent.state':
                 case 'call.event':
+                case 'call.amd_result':
+                case 'call.human_ready':
+                case 'call.bridged':
+                case 'call.wrap':
                 case 'queue.metrics':
+                case 'queue.lead_dialing':
+                case 'queue.lead_answered':
+                case 'queue.lead_abandoned':
                 case 'ai.whisper':
                 case 'supervisor.control': {
                     emitToOrg(org_id, {

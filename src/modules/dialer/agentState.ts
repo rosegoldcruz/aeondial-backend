@@ -138,6 +138,7 @@ export async function createAgentSession(
   agentId: string,
   campaignId: string | null,
   createdBy: string,
+  metadata: Record<string, unknown> = {},
 ): Promise<AgentSession> {
   const sessionId = crypto.randomUUID();
   const now = new Date().toISOString();
@@ -157,11 +158,12 @@ export async function createAgentSession(
       org_id: orgId,
       agent_id: agentId,
       campaign_id: campaignId,
-      state: 'READY',
-      started_at: now,
-      last_state_at: now,
-      created_by: createdBy,
-      updated_by: createdBy,
+        state: 'READY',
+        started_at: now,
+        last_state_at: now,
+        metadata,
+        created_by: createdBy,
+        updated_by: createdBy,
     })
     .select('session_id, org_id, agent_id, campaign_id, state, last_state_at')
     .single();

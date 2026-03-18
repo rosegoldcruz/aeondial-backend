@@ -10,6 +10,7 @@ export type WsEventType =
   | 'agent.state'          // agent FSM transition: READY / INCALL / WRAP …
   | 'call.event'
   | 'call.amd_result'      // AMD detection result for a call
+  | 'call.human_ready'     // human detected; agent alert leg/beep is in progress
   | 'call.bridged'         // agent + lead channels joined
   | 'call.wrap'            // call ended, wrap timer started
   | 'queue.metrics'
@@ -118,6 +119,7 @@ export const websocketPlugin: FastifyPluginAsync = async (app) => {
         case 'agent.state':
         case 'call.event':
         case 'call.amd_result':
+        case 'call.human_ready':
         case 'call.bridged':
         case 'call.wrap':
         case 'queue.metrics':

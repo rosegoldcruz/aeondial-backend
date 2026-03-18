@@ -12,11 +12,9 @@ export const campaignsModule: FastifyPluginAsync = async (app) => {
       return reply.status(401).send({ error: 'Missing org scope' });
     }
 
-    if (!org_id) {
-      return reply.status(400).send({ error: 'org_id is required' });
-    }
+    const scopedOrgId = org_id || req.org_id;
 
-    if (org_id !== req.org_id) {
+    if (scopedOrgId !== req.org_id) {
       return reply.status(403).send({ error: 'Cross-tenant access denied' });
     }
 

@@ -276,6 +276,21 @@ export const telephonyModule: FastifyPluginAsync = async (app) => {
     return reply.send(data || []);
   });
 
+  app.get('/calls/:call_id', async (req, reply) => {
+    const { call_id } = req.params as { call_id: string };
+
+    if (!req.org_id) {
+      return reply.status(401).send({ error: 'Missing org scope' });
+    }
+
+    const call = await getCallById(call_id, req.org_id, reply);
+    if (!call) {
+      return;
+    }
+
+    return reply.send(call);
+  });
+
   app.post('/calls/originate', async (req, reply) => {
     const body = (req.body || {}) as CallScopedPayload & {
       call_id?: string;

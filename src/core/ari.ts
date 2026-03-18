@@ -20,6 +20,12 @@ export interface AriOriginateParams {
   variables?: Record<string, string>;
 }
 
+export interface AriChannel {
+  id: string;
+  name?: string;
+  state?: string;
+}
+
 export class AriRequestError extends Error {
   status: number;
   responseText: string;
@@ -210,6 +216,33 @@ export const ARI = {
         method: 'POST',
         path: `/channels/${encodeURIComponent(channelId)}/play`,
         query: { media, playbackId },
+      });
+    },
+
+    get(channelId: string) {
+      return ariRequest<AriChannel>({
+        method: 'GET',
+        path: `/channels/${encodeURIComponent(channelId)}`,
+      });
+    },
+
+    continueInDialplan(
+      channelId: string,
+      context: string,
+      extension = 's',
+      priority = 1,
+      label?: string,
+    ) {
+      return ariRequest({
+        method: 'POST',
+        path: `/channels/${encodeURIComponent(channelId)}/continue`,
+        query: {
+          context,
+          extension,
+          priority,
+          label,
+        },
+        okStatuses: [204],
       });
     },
   },

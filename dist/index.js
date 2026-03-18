@@ -10,6 +10,7 @@ const websocket_1 = __importDefault(require("@fastify/websocket"));
 const config_1 = require("./core/config");
 const logger_1 = require("./core/logger");
 const redis_1 = require("./core/redis");
+const ariEvents_1 = require("./core/ariEvents");
 const auth_1 = require("./core/auth");
 const websocket_2 = require("./core/websocket");
 const orgs_1 = require("./modules/orgs");
@@ -21,9 +22,10 @@ const campaigns_1 = require("./modules/campaigns");
 const telephony_1 = require("./modules/telephony");
 const ai_1 = require("./modules/ai");
 const automations_1 = require("./modules/automations");
+const dialer_1 = require("./modules/dialer");
 async function buildServer() {
     (0, config_1.assertRequiredConfig)();
-    const app = (0, fastify_1.default)({ logger: logger_1.logger });
+    const app = (0, fastify_1.default)({ logger: true });
     await app.register(cors_1.default, {
         origin: [config_1.config.crmOrigin, config_1.config.aiWorkerOrigin],
         credentials: true,
@@ -47,11 +49,13 @@ async function buildServer() {
     await app.register(telephony_1.telephonyModule, { prefix: '/telephony' });
     await app.register(ai_1.aiModule, { prefix: '/ai' });
     await app.register(automations_1.automationsModule, { prefix: '/automations' });
+    await app.register(dialer_1.dialerModule, { prefix: '/dialer' });
     return app;
 }
 buildServer()
     .then(async (app) => {
     (0, redis_1.startBackgroundWorkers)();
+    (0, ariEvents_1.startAriEventService)();
     await app.listen({ port: config_1.config.port, host: '0.0.0.0' });
 })
     .catch((error) => {

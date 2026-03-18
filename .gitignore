@@ -1,5 +1,31 @@
 node_modules
-# Keep environment variables out of version control
+
+# Environment variables and local overrides
 .env
+.env.*
+!.env.example
+!.env*.example
+.envrc
+.direnv/
+
+# Secrets and local credential material
+secrets/
+secret/
+credentials/
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+*.p8
+*.jks
+*.keystore
+*service-account*.json
+*oauth*client*secret*.json
+
+# Build artifacts
+coverage/
+*.tsbuildinfo
 
 /generated/prisma

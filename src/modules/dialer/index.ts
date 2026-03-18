@@ -29,8 +29,6 @@
 
 import { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { supabase } from '../../core/supabase';
-import { ARI, AriRequestError } from '../../core/ari';
-import { emitOrgEvent } from '../../core/websocket';
 import { logger } from '../../core/logger';
 
 import {
@@ -41,6 +39,7 @@ import {
 } from './agentState';
 
 import { recordAmdResult, parseAmdResult, amdDispatchAction } from './amd';
+import { markDispositioned, processDialerAmdResult } from './orchestrator';
 
 import {
   seedDialerQueue,
@@ -74,6 +73,37 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
   // AGENT STATE ROUTES
   // ────────────────────────────────────────────────────────────────────────────
 
+  app.get('/agents/self/softphone', async (req, reply) => {
+    const orgId = requireOrg(req, reply);
+    if (!orgId) return;
+    if (!req.user_id) {
+      return reply.status(401).send({ error: 'Missing user scope' });
+    }
+
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('user_id, full_name, metadata')
+      .eq('user_id', req.user_id)
+      .eq('org_id', orgId)
+      .maybeSingle();
+
+    if (error) return reply.status(500).send({ error: error.message });
+    if (!user) return reply.status(404).send({ error: 'Agent not found' });
+
+    const metadata = (user.metadata || {}) as Record<string, unknown>;
+    const softphone = (metadata.softphone || {}) as Record<string, unknown>;
+    return reply.send({
+      agent_id: user.user_id,
+      display_name: user.full_name ?? null,
+      endpoint: softphone.endpoint ?? null,
+      sip_uri: softphone.sip_uri ?? null,
+      authorization_username: softphone.authorization_username ?? null,
+      password: softphone.password ?? null,
+      ws_server: softphone.ws_server ?? null,
+      metadata: softphone,
+    });
+  });
+
   /** POST /dialer/agents/session – login/go-ready */
   app.post('/agents/session', async (req, reply) => {
     const orgId = requireOrg(req, reply);
@@ -82,6 +112,8 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
     const body = (req.body || {}) as {
       agent_id?: string;
       campaign_id?: string | null;
+      endpoint?: string;
+      softphone?: Record<string, unknown>;
     };
 
     if (!body.agent_id) {
@@ -91,7 +123,7 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
     // Verify agent belongs to org
     const { data: agent, error: agentErr } = await supabase
       .from('users')
-      .select('user_id')
+      .select('user_id, metadata')
       .eq('user_id', body.agent_id)
       .eq('org_id', orgId)
       .maybeSingle();
@@ -99,12 +131,34 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
     if (agentErr) return reply.status(500).send({ error: agentErr.message });
     if (!agent) return reply.status(404).send({ error: 'Agent not found' });
 
+    const agentMetadata = (agent.metadata || {}) as Record<string, unknown>;
+    const storedSoftphone = (agentMetadata.softphone || {}) as Record<string, unknown>;
+    const endpoint =
+      body.endpoint ||
+      (typeof body.softphone?.endpoint === 'string' ? body.softphone.endpoint : null) ||
+      (typeof storedSoftphone.endpoint === 'string' ? storedSoftphone.endpoint : null);
+
+    if (!endpoint) {
+      return reply.status(400).send({ error: 'Agent endpoint is required before going READY' });
+    }
+
     try {
       const session = await createAgentSession(
         orgId,
         body.agent_id,
         body.campaign_id ?? null,
         req.user_id || body.agent_id,
+        {
+          endpoint,
+          softphone: {
+            ...storedSoftphone,
+            ...(body.softphone || {}),
+            endpoint,
+          },
+          auto_next: true,
+          wrap_until: null,
+          active_call_id: null,
+        },
       );
       return reply.status(201).send({ session });
     } catch (err) {
@@ -375,152 +429,14 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
       return reply.status(500).send({ error: msg });
     }
 
-    // Decide dispatch action
     const action = amdDispatchAction(amdResult);
 
-    // Fetch call to get session_id from metadata
-    const { data: call } = await supabase
-      .from('calls')
-      .select('call_id, org_id, campaign_id, metadata, status')
-      .eq('call_id', call_id)
-      .eq('org_id', orgId)
-      .maybeSingle();
-
-    if (!call) return reply.status(404).send({ error: 'Call not found' });
-
-    const metadata = (call.metadata || {}) as Record<string, unknown>;
-    const sessionId = typeof metadata.session_id === 'string' ? metadata.session_id : null;
-    const agentId = typeof metadata.agent_id === 'string' ? metadata.agent_id : null;
-    const clId = typeof metadata.cl_id === 'string' ? metadata.cl_id : null;
-
-    if (action === 'bridge' && sessionId) {
-      // Get agent's Asterisk channel endpoint
-      // For progressive dialer: agent endpoint is PJSIP/<agent_id> or stored in session metadata
-      const agentEndpoint = `${process.env.ARI_ENDPOINT_PREFIX ?? 'PJSIP'}/${agentId}`;
-      const bridgeId = crypto.randomUUID();
-
-      try {
-        // Create bridge, originate agent leg, add both channels
-        await ARI.bridges.create(bridgeId);
-
-        const agentChannel = await ARI.channels.originate({
-          endpoint: agentEndpoint,
-          channelId: `agent-${crypto.randomUUID()}`,
-          callerId: call_id,
-        }) as { id?: string } | undefined;
-
-        const agentChannelId =
-          agentChannel && typeof agentChannel === 'object' && agentChannel.id
-            ? agentChannel.id
-            : `agent-${agentId}`;
-
-        await ARI.bridges.addChannel(bridgeId, [call_id, agentChannelId]);
-
-        // Transition agent RESERVED → INCALL
-        if (sessionId) {
-          await transitionAgentState(sessionId, orgId, 'INCALL', { reason: 'call_bridged' });
-        }
-
-        // Update call
-        await supabase
-          .from('calls')
-          .update({
-            status: 'bridged',
-            started_at: new Date().toISOString(),
-            assigned_agent: agentId,
-            metadata: {
-              ...metadata,
-              ari_bridge_id: bridgeId,
-              agent_channel_id: agentChannelId,
-            },
-            updated_at: new Date().toISOString(),
-          })
-          .eq('call_id', call_id)
-          .eq('org_id', orgId);
-
-        // Mark campaign_lead answered
-        if (clId) {
-          await supabase
-            .from('campaign_leads')
-            .update({ dial_state: 'answered', updated_at: new Date().toISOString() })
-            .eq('cl_id', clId)
-            .eq('org_id', orgId);
-        }
-
-        emitOrgEvent({
-          type: 'call.bridged',
-          org_id: orgId,
-          campaign_id: call.campaign_id ?? undefined,
-          payload: {
-            call_id,
-            agent_id: agentId,
-            session_id: sessionId,
-            bridge_id: bridgeId,
-            amd_result: amdResult,
-          },
-        });
-
-        emitOrgEvent({
-          type: 'queue.lead_answered',
-          org_id: orgId,
-          campaign_id: call.campaign_id ?? undefined,
-          payload: { call_id, cl_id: clId, agent_id: agentId, amd_result: amdResult },
-        });
-      } catch (bridgeErr) {
-        const errMsg =
-          bridgeErr instanceof AriRequestError
-            ? bridgeErr.message
-            : bridgeErr instanceof Error ? bridgeErr.message : String(bridgeErr);
-
-        logger.error({ org_id: orgId, call_id, err: errMsg }, 'Bridge failed after AMD=HUMAN');
-
-        // Release agent back to READY on bridge failure
-        if (sessionId) {
-          await transitionAgentState(sessionId, orgId, 'READY', { reason: 'bridge_failed' }).catch(() => undefined);
-        }
-      }
-
-    } else if (action === 'voicemail' || action === 'hangup') {
-      // Play voicemail drop if configured, then hangup lead channel
-      const vmFile = process.env.DIALER_VOICEMAIL_FILE;
-      if (action === 'voicemail' && vmFile) {
-        try {
-          await ARI.channels.play(call_id, `sound:${vmFile}`);
-          // Short delay to let file play; hangup after ~5s (dialplan should handle this)
-        } catch {
-          // Non-fatal; proceed to hangup
-        }
-      }
-
-      try {
-        await ARI.channels.hangup(call_id);
-      } catch {
-        // Channel may already be gone
-      }
-
-      // Release agent back to READY
-      if (sessionId) {
-        await transitionAgentState(sessionId, orgId, 'READY', {
-          reason: amdResult === 'MACHINE' ? 'amd_machine' : 'amd_failed',
-        }).catch(() => undefined);
-      }
-
-      if (clId) {
-        await supabase
-          .from('campaign_leads')
-          .update({
-            dial_state: amdResult === 'MACHINE' ? 'no_answer' : 'failed',
-            updated_at: new Date().toISOString(),
-          })
-          .eq('cl_id', clId)
-          .eq('org_id', orgId);
-      }
-
-      await supabase
-        .from('calls')
-        .update({ status: 'ended', ended_at: new Date().toISOString(), updated_at: new Date().toISOString() })
-        .eq('call_id', call_id)
-        .eq('org_id', orgId);
+    try {
+      await processDialerAmdResult(call_id, orgId, amdResult, cause, durationMs);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Dialer orchestration error';
+      logger.error({ err, org_id: orgId, call_id }, 'Failed processing AMD result');
+      return reply.status(500).send({ error: msg });
     }
 
     return reply.send({ success: true, action, amd_result: amdResult });
@@ -558,7 +474,7 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
     // Fetch call (org-scoped)
     const { data: call, error: callErr } = await supabase
       .from('calls')
-      .select('call_id, org_id, campaign_id, metadata')
+      .select('call_id, org_id, campaign_id, cl_id, metadata')
       .eq('call_id', call_id)
       .eq('org_id', orgId)
       .maybeSingle();
@@ -567,7 +483,7 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
     if (!call) return reply.status(404).send({ error: 'Call not found' });
 
     const metadata = (call.metadata || {}) as Record<string, unknown>;
-    const clId = typeof metadata.cl_id === 'string' ? metadata.cl_id : null;
+    const clId = call.cl_id ?? (typeof metadata.cl_id === 'string' ? metadata.cl_id : null);
 
     const disposition_id = crypto.randomUUID();
     const { error: dispErr } = await supabase.from('dispositions').insert({
@@ -605,6 +521,8 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
         .eq('org_id', orgId);
     }
 
+    await markDispositioned(call_id, orgId);
+
     // Transition agent WRAP → READY if session_id provided
     if (body.session_id) {
       await transitionAgentState(body.session_id, orgId, 'READY', {
@@ -628,7 +546,7 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
       .from('calls')
       .select('call_id, org_id, campaign_id, contact_id, lead_id, assigned_agent, status, started_at, metadata')
       .eq('org_id', orgId)
-      .in('status', ['dialing', 'originated', 'bridged', 'answering'])
+      .in('status', ['QUEUED', 'DIALING_LEAD', 'ANSWERED', 'AMD_HUMAN', 'AMD_MACHINE', 'BRIDGED', 'dialing', 'originated', 'bridged', 'answering'])
       .order('started_at', { ascending: false })
       .limit(safeLimit);
 
@@ -667,7 +585,7 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
       .from('calls')
       .select('call_id, campaign_id, contact_id, lead_id, assigned_agent, status, started_at')
       .eq('org_id', orgId)
-      .in('status', ['dialing', 'originated', 'bridged']);
+      .in('status', ['QUEUED', 'DIALING_LEAD', 'ANSWERED', 'AMD_HUMAN', 'AMD_MACHINE', 'BRIDGED', 'dialing', 'originated', 'bridged']);
 
     if (campaign_id) callsQuery = callsQuery.eq('campaign_id', campaign_id);
 
