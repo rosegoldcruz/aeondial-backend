@@ -44,6 +44,13 @@ function stringValue(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value : null;
 }
 
+function normalizeAgentEndpoint(endpoint: string): string {
+  const trimmed = endpoint.trim();
+  if (!trimmed) return trimmed;
+  if (trimmed.includes('/')) return trimmed;
+  return `${config.ariEndpointPrefix}/${trimmed}`;
+}
+
 function endpointFromTemplate(phone: string): string {
   const number = phone.replace(/^\+/, '');
   const template = config.dialerOutboundEndpointTemplate;
@@ -102,7 +109,7 @@ async function resolveAgentEndpoint(
     const session = await getAgentSessionRow(sessionId, orgId);
     const sessionEndpoint = stringValue(session?.metadata?.endpoint);
     if (sessionEndpoint) {
-      return sessionEndpoint;
+      return normalizeAgentEndpoint(sessionEndpoint);
     }
   }
 
@@ -111,7 +118,7 @@ async function resolveAgentEndpoint(
     const softphone = (user?.metadata?.softphone || {}) as Record<string, unknown>;
     const softphoneEndpoint = stringValue(softphone.endpoint);
     if (softphoneEndpoint) {
-      return softphoneEndpoint;
+      return normalizeAgentEndpoint(softphoneEndpoint);
     }
   }
 

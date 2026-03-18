@@ -31,6 +31,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.dialerModule = void 0;
 const supabase_1 = require("../../core/supabase");
 const logger_1 = require("../../core/logger");
+const config_1 = require("../../core/config");
 const agentState_1 = require("./agentState");
 const amd_1 = require("./amd");
 const orchestrator_1 = require("./orchestrator");
@@ -42,6 +43,14 @@ function requireOrg(req, reply) {
         return null;
     }
     return req.org_id;
+}
+function normalizeAgentEndpoint(endpoint) {
+    const trimmed = endpoint.trim();
+    if (!trimmed)
+        return trimmed;
+    if (trimmed.includes('/'))
+        return trimmed;
+    return `${config_1.config.ariEndpointPrefix}/${trimmed}`;
 }
 // ─── Plugin ──────────────────────────────────────────────────────────────────
 const dialerModule = async (app) => {
@@ -69,19 +78,46 @@ const dialerModule = async (app) => {
             .maybeSingle();
         if (error)
             return reply.status(500).send({ error: error.message });
-        if (!user)
-            return reply.status(404).send({ error: 'Agent not found' });
+        if (!user) {
+            const fallbackEndpoint = config_1.config.dialerDefaultAgentEndpoint || null;
+            return reply.send({
+                agent_id: req.user_id,
+                display_name: null,
+                endpoint: fallbackEndpoint,
+                sip_uri: null,
+                authorization_username: null,
+                password: null,
+                ws_server: null,
+                metadata: fallbackEndpoint
+                    ? {
+                        endpoint: fallbackEndpoint,
+                        transport: config_1.config.dialerDefaultAgentTransport,
+                        host: config_1.config.dialerDefaultAgentHost || null,
+                    }
+                    : {},
+            });
+        }
         const metadata = (user.metadata || {});
         const softphone = (metadata.softphone || {});
+        const fallbackEndpoint = (typeof softphone.endpoint === 'string' && softphone.endpoint.trim()) ? softphone.endpoint : config_1.config.dialerDefaultAgentEndpoint || null;
         return reply.send({
             agent_id: user.user_id,
             display_name: user.full_name ?? null,
-            endpoint: softphone.endpoint ?? null,
+            endpoint: fallbackEndpoint,
             sip_uri: softphone.sip_uri ?? null,
             authorization_username: softphone.authorization_username ?? null,
             password: softphone.password ?? null,
             ws_server: softphone.ws_server ?? null,
-            metadata: softphone,
+            metadata: {
+                ...(softphone || {}),
+                ...(fallbackEndpoint && !softphone.endpoint
+                    ? {
+                        endpoint: fallbackEndpoint,
+                        transport: config_1.config.dialerDefaultAgentTransport,
+                        host: config_1.config.dialerDefaultAgentHost || null,
+                    }
+                    : {}),
+            },
         });
     });
     /** POST /dialer/agents/session – login/go-ready */
@@ -106,12 +142,13 @@ const dialerModule = async (app) => {
             return reply.status(404).send({ error: 'Agent not found' });
         const agentMetadata = (agent.metadata || {});
         const storedSoftphone = (agentMetadata.softphone || {});
-        const endpoint = body.endpoint ||
+        const rawEndpoint = body.endpoint ||
             (typeof body.softphone?.endpoint === 'string' ? body.softphone.endpoint : null) ||
             (typeof storedSoftphone.endpoint === 'string' ? storedSoftphone.endpoint : null);
-        if (!endpoint) {
+        if (!rawEndpoint) {
             return reply.status(400).send({ error: 'Agent endpoint is required before going READY' });
         }
+        const endpoint = normalizeAgentEndpoint(rawEndpoint);
         try {
             const session = await (0, agentState_1.createAgentSession)(orgId, body.agent_id, body.campaign_id ?? null, req.user_id || body.agent_id, {
                 endpoint,

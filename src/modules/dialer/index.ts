@@ -30,6 +30,7 @@
 import { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { supabase } from '../../core/supabase';
 import { logger } from '../../core/logger';
+import { config } from '../../core/config';
 
 import {
   createAgentSession,
@@ -57,6 +58,13 @@ function requireOrg(req: FastifyRequest, reply: FastifyReply): string | null {
     return null;
   }
   return req.org_id;
+}
+
+function normalizeAgentEndpoint(endpoint: string): string {
+  const trimmed = endpoint.trim();
+  if (!trimmed) return trimmed;
+  if (trimmed.includes('/')) return trimmed;
+  return `${config.ariEndpointPrefix}/${trimmed}`;
 }
 
 // ─── Plugin ──────────────────────────────────────────────────────────────────
@@ -88,19 +96,48 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
       .maybeSingle();
 
     if (error) return reply.status(500).send({ error: error.message });
-    if (!user) return reply.status(404).send({ error: 'Agent not found' });
+    if (!user) {
+      const fallbackEndpoint = config.dialerDefaultAgentEndpoint || null;
+      return reply.send({
+        agent_id: req.user_id,
+        display_name: null,
+        endpoint: fallbackEndpoint,
+        sip_uri: null,
+        authorization_username: null,
+        password: null,
+        ws_server: null,
+        metadata: fallbackEndpoint
+          ? {
+              endpoint: fallbackEndpoint,
+              transport: config.dialerDefaultAgentTransport,
+              host: config.dialerDefaultAgentHost || null,
+            }
+          : {},
+      });
+    }
 
     const metadata = (user.metadata || {}) as Record<string, unknown>;
     const softphone = (metadata.softphone || {}) as Record<string, unknown>;
+    const fallbackEndpoint =
+      (typeof softphone.endpoint === 'string' && softphone.endpoint.trim()) ? softphone.endpoint : config.dialerDefaultAgentEndpoint || null;
     return reply.send({
       agent_id: user.user_id,
       display_name: user.full_name ?? null,
-      endpoint: softphone.endpoint ?? null,
+      endpoint: fallbackEndpoint,
       sip_uri: softphone.sip_uri ?? null,
       authorization_username: softphone.authorization_username ?? null,
       password: softphone.password ?? null,
       ws_server: softphone.ws_server ?? null,
-      metadata: softphone,
+      metadata: {
+        ...(softphone || {}),
+        ...(fallbackEndpoint && !softphone.endpoint
+          ? {
+              endpoint: fallbackEndpoint,
+              transport: config.dialerDefaultAgentTransport,
+              host: config.dialerDefaultAgentHost || null,
+            }
+          : {}),
+      },
     });
   });
 
@@ -133,14 +170,15 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
 
     const agentMetadata = (agent.metadata || {}) as Record<string, unknown>;
     const storedSoftphone = (agentMetadata.softphone || {}) as Record<string, unknown>;
-    const endpoint =
+    const rawEndpoint =
       body.endpoint ||
       (typeof body.softphone?.endpoint === 'string' ? body.softphone.endpoint : null) ||
       (typeof storedSoftphone.endpoint === 'string' ? storedSoftphone.endpoint : null);
 
-    if (!endpoint) {
+    if (!rawEndpoint) {
       return reply.status(400).send({ error: 'Agent endpoint is required before going READY' });
     }
+    const endpoint = normalizeAgentEndpoint(rawEndpoint);
 
     try {
       const session = await createAgentSession(

@@ -18,6 +18,9 @@ export const config = {
     process.env.DIALER_OUTBOUND_ENDPOINT_TEMPLATE || `${process.env.ARI_ENDPOINT_PREFIX || 'PJSIP'}/{number}`,
   dialerAgentBeepMedia: process.env.DIALER_AGENT_BEEP_MEDIA || 'sound:beep',
   dialerWrapSeconds: Number(process.env.DIALER_WRAP_SECONDS || 15),
+  dialerDefaultAgentEndpoint: process.env.DIALER_DEFAULT_AGENT_ENDPOINT || '',
+  dialerDefaultAgentTransport: process.env.DIALER_DEFAULT_AGENT_TRANSPORT || 'udp',
+  dialerDefaultAgentHost: process.env.DIALER_DEFAULT_AGENT_HOST || '',
 };
 
 export function assertRequiredConfig(): void {
