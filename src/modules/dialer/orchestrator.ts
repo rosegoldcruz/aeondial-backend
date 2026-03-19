@@ -379,6 +379,7 @@ async function originateAgentAlert(call: DialerCallRow, endpoint: string): Promi
   const sessionId = stringValue(metadata.session_id);
 
   const agentChannel = await ARI.channels.originate({
+    debugContext: 'dialer.agent_alert',
     endpoint,
     appArgs: `agent-alert,${call.call_id},${call.org_id}`,
     channelId: agentChannelId,

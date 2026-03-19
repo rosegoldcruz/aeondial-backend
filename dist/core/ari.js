@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ARI = exports.AriRequestError = void 0;
 const config_1 = require("./config");
+const logger_1 = require("./logger");
 class AriRequestError extends Error {
     constructor(message, status, responseText) {
         super(message);
@@ -51,18 +52,31 @@ async function ariRequest({ method, path, query, body, okStatuses = [200, 201, 2
 exports.ARI = {
     channels: {
         originate(params) {
+            const query = {
+                endpoint: params.endpoint,
+                app: params.app || config_1.config.ariApp,
+                appArgs: params.appArgs,
+                callerId: params.callerId,
+                timeout: params.timeout,
+                channelId: params.channelId,
+            };
+            const body = params.variables ? { variables: params.variables } : undefined;
+            logger_1.logger.info({
+                debug_context: params.debugContext || 'unspecified',
+                ari_route: buildUrl('/channels', query),
+                endpoint: query.endpoint,
+                app: query.app,
+                appArgs: query.appArgs,
+                callerId: query.callerId,
+                timeout: query.timeout,
+                channelId: query.channelId,
+                body,
+            }, 'ARI originate request');
             return ariRequest({
                 method: 'POST',
                 path: '/channels',
-                query: {
-                    endpoint: params.endpoint,
-                    app: params.app || config_1.config.ariApp,
-                    appArgs: params.appArgs,
-                    callerId: params.callerId,
-                    timeout: params.timeout,
-                    channelId: params.channelId,
-                },
-                body: params.variables ? { variables: params.variables } : undefined,
+                query,
+                body,
             });
         },
         redirect(channelId, endpoint) {

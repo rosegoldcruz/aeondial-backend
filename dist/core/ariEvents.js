@@ -83,10 +83,6 @@ async function handleAriEvent(event) {
         }
         case 'ChannelStateChange': {
             await recordChannelEvent(event, 'ari.channel_state');
-            if (event.channel?.state === 'Up' && event.channel.id) {
-                await (0, orchestrator_1.handleLeadChannelAnswered)(event.channel.id).catch(() => undefined);
-                await (0, orchestrator_1.handleAgentAlertAnswered)(event.channel.id).catch(() => undefined);
-            }
             return;
         }
         case 'ChannelEnteredBridge':

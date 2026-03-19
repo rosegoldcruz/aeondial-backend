@@ -67,9 +67,103 @@ function normalizeAgentEndpoint(endpoint: string): string {
   return `${config.ariEndpointPrefix}/${trimmed}`;
 }
 
+function parseUrlEncodedBody(payload: string): Record<string, string> {
+  return Object.fromEntries(new URLSearchParams(payload).entries());
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (Array.isArray(value)) {
+      const nested = firstString(...value);
+      if (nested) return nested;
+      continue;
+    }
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed) return trimmed;
+    }
+  }
+  return undefined;
+}
+
+function firstNumber(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    if (Array.isArray(value)) {
+      const nested = firstNumber(...value);
+      if (nested !== undefined) return nested;
+      continue;
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return undefined;
+}
+
+function coerceRequestBody(body: unknown): Record<string, unknown> {
+  if (!body) return {};
+  if (typeof body === 'object') return body as Record<string, unknown>;
+  if (typeof body !== 'string') return {};
+
+  const trimmed = body.trim();
+  if (!trimmed) return {};
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === 'object') {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // Fall back to URL-encoded parsing for plain-text dialplan callbacks.
+  }
+
+  return parseUrlEncodedBody(trimmed);
+}
+
+function normalizeAmdCallbackPayload(req: FastifyRequest): {
+  callId?: string;
+  orgId?: string;
+  amdStatus?: string;
+  amdCause?: string;
+  durationMs?: number;
+  body: Record<string, unknown>;
+  query: Record<string, unknown>;
+  params: Record<string, unknown>;
+} {
+  const params = (req.params || {}) as Record<string, unknown>;
+  const query = (req.query || {}) as Record<string, unknown>;
+  const body = coerceRequestBody(req.body);
+
+  return {
+    callId: firstString(params.call_id, params.id, body.call_id, body.callId, query.call_id, query.callId),
+    orgId: firstString(body.org_id, body.orgId, query.org_id, query.orgId, req.org_id),
+    amdStatus: firstString(body.AMDSTATUS, body.result, body.status, query.AMDSTATUS, query.result, query.status),
+    amdCause: firstString(body.AMDCAUSE, body.cause, query.AMDCAUSE, query.cause),
+    durationMs: firstNumber(body.duration_ms, body.durationMs, query.duration_ms, query.durationMs),
+    body,
+    query,
+    params,
+  };
+}
+
 // ─── Plugin ──────────────────────────────────────────────────────────────────
 
 export const dialerModule: FastifyPluginAsync = async (app) => {
+  app.addContentTypeParser(
+    'application/x-www-form-urlencoded',
+    { parseAs: 'string' },
+    (_req, payload, done) => {
+      try {
+        const rawPayload = typeof payload === 'string' ? payload : payload.toString('utf8');
+        done(null, parseUrlEncodedBody(rawPayload));
+      } catch (error) {
+        done(error as Error);
+      }
+    },
+  );
+
   app.get('/', async (req) => ({
     module: 'dialer',
     org_id: req.org_id,
@@ -526,36 +620,46 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
    * Called by Asterisk dialplan via CURL() after AMD() completes.
    * The dialplan variable DIALER_BACKEND_URL is set during origination.
    *
-   * Expected body: { org_id, result, cause?, duration_ms? }
-   * Alternatively as query params for simple CURL() dialplan calls.
+   * Accepts:
+   *   - application/json
+   *   - application/x-www-form-urlencoded
+   *   - query params when the request body is empty
+   *
+   * Normalized fields: { call_id, org_id, result|AMDSTATUS, cause|AMDCAUSE, duration_ms? }
    */
   app.post('/calls/:call_id/amd_result', async (req, reply) => {
-    // AMD webhooks come from Asterisk, not a browser; accept org_id from body or header
-    const body = (req.body || {}) as {
-      org_id?: string;
-      result?: string;
-      cause?: string;
-      duration_ms?: number;
-    };
-    const query = req.query as {
-      org_id?: string;
-      result?: string;
-      cause?: string;
-      duration_ms?: string;
-    };
-
-    const orgId = body.org_id ?? query.org_id ?? req.org_id;
-    const rawResult = body.result ?? query.result ?? '';
-    const cause = body.cause ?? query.cause;
-    const durationMs = body.duration_ms ?? (query.duration_ms ? Number(query.duration_ms) : undefined);
+    const normalized = normalizeAmdCallbackPayload(req);
+    const orgId = normalized.orgId;
+    const callId = normalized.callId;
+    const rawResult = normalized.amdStatus ?? '';
+    const cause = normalized.amdCause;
+    const durationMs = normalized.durationMs;
 
     if (!orgId) return reply.status(400).send({ error: 'org_id is required' });
+    if (!callId) return reply.status(400).send({ error: 'call_id is required' });
 
-    const { call_id } = req.params as { call_id: string };
     const amdResult = parseAmdResult(rawResult);
+    logger.info(
+      {
+        route: 'dialer.calls.amd_result',
+        content_type: req.headers['content-type'],
+        params_id: normalized.params.id ?? normalized.params.call_id,
+        query: normalized.query,
+        body: normalized.body,
+        normalized: {
+          callId,
+          orgId,
+          amdStatus: rawResult,
+          amdCause: cause,
+          durationMs,
+          parsedResult: amdResult,
+        },
+      },
+      'Received dialer AMD callback',
+    );
 
     try {
-      await recordAmdResult({ call_id, org_id: orgId, result: amdResult, cause, duration_ms: durationMs });
+      await recordAmdResult({ call_id: callId, org_id: orgId, result: amdResult, cause, duration_ms: durationMs });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'AMD result error';
       return reply.status(500).send({ error: msg });
@@ -564,10 +668,10 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
     const action = amdDispatchAction(amdResult);
 
     try {
-      await processDialerAmdResult(call_id, orgId, amdResult, cause, durationMs);
+      await processDialerAmdResult(callId, orgId, amdResult, cause, durationMs);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Dialer orchestration error';
-      logger.error({ err, org_id: orgId, call_id }, 'Failed processing AMD result');
+      logger.error({ err, org_id: orgId, call_id: callId }, 'Failed processing AMD result');
       return reply.status(500).send({ error: msg });
     }
 

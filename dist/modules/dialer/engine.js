@@ -249,6 +249,7 @@ async function processDialerJob(job) {
     let ariChannelId;
     try {
         const ariChannel = await ari_1.ARI.channels.originate({
+            debugContext: 'dialer.lead',
             endpoint,
             callerId: await resolveCallerId(org_id, campaign_id),
             channelId: call_id,

@@ -114,10 +114,6 @@ async function handleAriEvent(event: AriEvent): Promise<void> {
 
     case 'ChannelStateChange': {
       await recordChannelEvent(event, 'ari.channel_state');
-      if (event.channel?.state === 'Up' && event.channel.id) {
-        await handleLeadChannelAnswered(event.channel.id).catch(() => undefined);
-        await handleAgentAlertAnswered(event.channel.id).catch(() => undefined);
-      }
       return;
     }
 

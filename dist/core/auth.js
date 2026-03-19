@@ -47,6 +47,9 @@ const authPlugin = async (app) => {
 };
 exports.authPlugin = authPlugin;
 const PUBLIC_PATHS = new Set(['/health', '/version', '/ws']);
+const INTERNAL_CALLBACK_PATHS = [
+    /^\/dialer\/calls\/[^/]+\/amd_result$/,
+];
 const VALID_ROLES = new Set(['owner', 'admin', 'agent']);
 const AGENT_WRITE_ALLOWLIST = [
     /^\/dialer\/agents\/session$/,
@@ -75,9 +78,12 @@ function isWriteMethod(method) {
 function isAgentWriteAllowed(path) {
     return AGENT_WRITE_ALLOWLIST.some((pattern) => pattern.test(path));
 }
+function bypassTenantContext(path) {
+    return PUBLIC_PATHS.has(path) || INTERNAL_CALLBACK_PATHS.some((pattern) => pattern.test(path));
+}
 async function requireTenantContext(req, reply) {
     const path = req.url.split('?')[0];
-    if (PUBLIC_PATHS.has(path)) {
+    if (bypassTenantContext(path)) {
         return;
     }
     if (!req.org_id) {

@@ -1,4 +1,5 @@
 import { config } from './config';
+import { logger } from './logger';
 
 type AriQueryValue = string | number | boolean | undefined;
 
@@ -18,6 +19,7 @@ export interface AriOriginateParams {
   timeout?: number;
   channelId?: string;
   variables?: Record<string, string>;
+  debugContext?: string;
 }
 
 export interface AriChannel {
@@ -97,18 +99,34 @@ async function ariRequest<T = Record<string, unknown>>({
 export const ARI = {
   channels: {
     originate(params: AriOriginateParams) {
+      const query = {
+        endpoint: params.endpoint,
+        app: params.app || config.ariApp,
+        appArgs: params.appArgs,
+        callerId: params.callerId,
+        timeout: params.timeout,
+        channelId: params.channelId,
+      };
+      const body = params.variables ? { variables: params.variables } : undefined;
+      logger.info(
+        {
+          debug_context: params.debugContext || 'unspecified',
+          ari_route: buildUrl('/channels', query),
+          endpoint: query.endpoint,
+          app: query.app,
+          appArgs: query.appArgs,
+          callerId: query.callerId,
+          timeout: query.timeout,
+          channelId: query.channelId,
+          body,
+        },
+        'ARI originate request',
+      );
       return ariRequest({
         method: 'POST',
         path: '/channels',
-        query: {
-          endpoint: params.endpoint,
-          app: params.app || config.ariApp,
-          appArgs: params.appArgs,
-          callerId: params.callerId,
-          timeout: params.timeout,
-          channelId: params.channelId,
-        },
-        body: params.variables ? { variables: params.variables } : undefined,
+        query,
+        body,
       });
     },
 

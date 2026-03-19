@@ -17,7 +17,7 @@ exports.config = {
     ariPassword: process.env.ARI_PASSWORD || '',
     ariApp: process.env.ARI_APP || 'aeondial',
     ariEndpointPrefix: process.env.ARI_ENDPOINT_PREFIX || 'PJSIP',
-    dialerOutboundEndpointTemplate: process.env.DIALER_OUTBOUND_ENDPOINT_TEMPLATE || `${process.env.ARI_ENDPOINT_PREFIX || 'PJSIP'}/{number}`,
+    dialerOutboundEndpointTemplate: process.env.DIALER_OUTBOUND_ENDPOINT_TEMPLATE || `${process.env.ARI_ENDPOINT_PREFIX || 'PJSIP'}/{phone}@twilio-endpoint`,
     dialerAgentBeepMedia: process.env.DIALER_AGENT_BEEP_MEDIA || 'sound:beep',
     dialerWrapSeconds: Number(process.env.DIALER_WRAP_SECONDS || 15),
     dialerDefaultAgentEndpoint: process.env.DIALER_DEFAULT_AGENT_ENDPOINT || '',

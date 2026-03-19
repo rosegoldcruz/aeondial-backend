@@ -59,6 +59,9 @@ export const authPlugin: FastifyPluginAsync = async (app) => {
 };
 
 const PUBLIC_PATHS = new Set(['/health', '/version', '/ws']);
+const INTERNAL_CALLBACK_PATHS = [
+  /^\/dialer\/calls\/[^/]+\/amd_result$/,
+];
 const VALID_ROLES = new Set<Role>(['owner', 'admin', 'agent']);
 const AGENT_WRITE_ALLOWLIST = [
   /^\/dialer\/agents\/session$/,
@@ -93,12 +96,16 @@ function isAgentWriteAllowed(path: string): boolean {
   return AGENT_WRITE_ALLOWLIST.some((pattern) => pattern.test(path));
 }
 
+function bypassTenantContext(path: string): boolean {
+  return PUBLIC_PATHS.has(path) || INTERNAL_CALLBACK_PATHS.some((pattern) => pattern.test(path));
+}
+
 export async function requireTenantContext(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<void> {
   const path = req.url.split('?')[0];
-  if (PUBLIC_PATHS.has(path)) {
+  if (bypassTenantContext(path)) {
     return;
   }
 
