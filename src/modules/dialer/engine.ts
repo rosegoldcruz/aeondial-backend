@@ -49,7 +49,7 @@ export interface DialerJobData {
 const dialerQueues = new Map<string, Queue>();
 
 function queueName(orgId: string, campaignId: string): string {
-  return `dialer:${orgId}:${campaignId}`;
+  return `dialer__${orgId}__${campaignId}`;
 }
 
 export function getDialerQueue(orgId: string, campaignId: string): Queue {

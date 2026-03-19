@@ -1,8 +1,12 @@
 "use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.startAriEventService = startAriEventService;
 const config_1 = require("./config");
 const logger_1 = require("./logger");
+const ws_1 = __importDefault(require("ws"));
 const orchestrator_1 = require("../modules/dialer/orchestrator");
 const callState_1 = require("../modules/dialer/callState");
 let socket = null;
@@ -122,19 +126,19 @@ async function connectAriEventSocket() {
         logger_1.logger.warn('ARI event service disabled: missing ARI configuration');
         return;
     }
-    if (socket && socket.readyState === WebSocket.OPEN) {
+    if (socket && socket.readyState === ws_1.default.OPEN) {
         return;
     }
     const url = buildEventsUrl();
-    socket = new WebSocket(url);
-    socket.addEventListener('open', () => {
+    socket = new ws_1.default(url);
+    socket.on('open', () => {
         reconnectAttempt = 0;
         logger_1.logger.info({ url, app: config_1.config.ariApp }, 'Connected to ARI event socket');
     });
-    socket.addEventListener('message', (message) => {
+    socket.on('message', (message) => {
         let event;
         try {
-            event = JSON.parse(String(message.data));
+            event = JSON.parse(message.toString());
         }
         catch (error) {
             logger_1.logger.warn({ error }, 'Ignoring malformed ARI websocket message');
@@ -144,10 +148,10 @@ async function connectAriEventSocket() {
             logger_1.logger.error({ error, event_type: event.type }, 'Unhandled ARI event processing error');
         });
     });
-    socket.addEventListener('error', (error) => {
+    socket.on('error', (error) => {
         logger_1.logger.error({ error }, 'ARI websocket error');
     });
-    socket.addEventListener('close', () => {
+    socket.on('close', () => {
         logger_1.logger.warn('ARI websocket closed; scheduling reconnect');
         scheduleReconnect();
     });

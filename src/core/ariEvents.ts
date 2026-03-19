@@ -1,5 +1,6 @@
 import { config } from './config';
 import { logger } from './logger';
+import WebSocket from 'ws';
 import {
   finalizeBridgeAfterBeep,
   findCallByBridgeId,
@@ -171,15 +172,15 @@ async function connectAriEventSocket(): Promise<void> {
   const url = buildEventsUrl();
   socket = new WebSocket(url);
 
-  socket.addEventListener('open', () => {
+  socket.on('open', () => {
     reconnectAttempt = 0;
     logger.info({ url, app: config.ariApp }, 'Connected to ARI event socket');
   });
 
-  socket.addEventListener('message', (message: MessageEvent) => {
+  socket.on('message', (message) => {
     let event: AriEvent;
     try {
-      event = JSON.parse(String(message.data)) as AriEvent;
+      event = JSON.parse(message.toString()) as AriEvent;
     } catch (error) {
       logger.warn({ error }, 'Ignoring malformed ARI websocket message');
       return;
@@ -190,11 +191,11 @@ async function connectAriEventSocket(): Promise<void> {
     });
   });
 
-  socket.addEventListener('error', (error) => {
+  socket.on('error', (error) => {
     logger.error({ error }, 'ARI websocket error');
   });
 
-  socket.addEventListener('close', () => {
+  socket.on('close', () => {
     logger.warn('ARI websocket closed; scheduling reconnect');
     scheduleReconnect();
   });

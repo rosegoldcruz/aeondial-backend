@@ -4,38 +4,50 @@
 -- ============================================================
 
 -- Agent state enum
-create type if not exists agent_state as enum (
-  'OFFLINE',
-  'READY',
-  'RESERVED',
-  'INCALL',
-  'WRAP',
-  'PAUSED'
-);
+do $$ begin
+  create type agent_state as enum (
+    'OFFLINE',
+    'READY',
+    'RESERVED',
+    'INCALL',
+    'WRAP',
+    'PAUSED'
+  );
+exception
+  when duplicate_object then null;
+end $$;
 
 -- Disposition outcome enum
-create type if not exists disposition_outcome as enum (
-  'ANSWERED_HUMAN',
-  'ANSWERED_MACHINE',
-  'NO_ANSWER',
-  'BUSY',
-  'FAILED',
-  'DNC',
-  'CALLBACK',
-  'SALE',
-  'NOT_INTERESTED',
-  'WRONG_NUMBER',
-  'OTHER'
-);
+do $$ begin
+  create type disposition_outcome as enum (
+    'ANSWERED_HUMAN',
+    'ANSWERED_MACHINE',
+    'NO_ANSWER',
+    'BUSY',
+    'FAILED',
+    'DNC',
+    'CALLBACK',
+    'SALE',
+    'NOT_INTERESTED',
+    'WRONG_NUMBER',
+    'OTHER'
+  );
+exception
+  when duplicate_object then null;
+end $$;
 
 -- AMD result enum
-create type if not exists amd_result as enum (
-  'HUMAN',
-  'MACHINE',
-  'NOTSURE',
-  'FAILED',
-  'TIMEOUT'
-);
+do $$ begin
+  create type amd_result as enum (
+    'HUMAN',
+    'MACHINE',
+    'NOTSURE',
+    'FAILED',
+    'TIMEOUT'
+  );
+exception
+  when duplicate_object then null;
+end $$;
 
 -- ─── agent_sessions ──────────────────────────────────────────
 -- One row per login session. Tracks current FSM state.

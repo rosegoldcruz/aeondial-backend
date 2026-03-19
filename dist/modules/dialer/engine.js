@@ -40,7 +40,7 @@ const callState_1 = require("./callState");
 // ── Queue factory ─────────────────────────────────────────────────────────────
 const dialerQueues = new Map();
 function queueName(orgId, campaignId) {
-    return `dialer:${orgId}:${campaignId}`;
+    return `dialer__${orgId}__${campaignId}`;
 }
 function getDialerQueue(orgId, campaignId) {
     const name = queueName(orgId, campaignId);
