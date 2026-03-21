@@ -180,10 +180,13 @@ const dialerModule = async (app) => {
         if (!user) {
             const bootstrapEmail = typeof headerEmail === 'string' && headerEmail.trim()
                 ? headerEmail.trim().toLowerCase()
-                : `${req.user_id}@clerk.local`;
+                : null;
             const bootstrapName = typeof headerName === 'string' && headerName.trim()
                 ? headerName.trim()
                 : null;
+            if (!bootstrapEmail) {
+                return reply.status(401).send({ error: 'Missing authenticated user identity (x-user-email)' });
+            }
             const { data: seededUser, error: seedError } = await supabase_1.supabase
                 .from('users')
                 .upsert({
