@@ -31,6 +31,7 @@ import { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { supabase } from '../../core/supabase';
 import { logger } from '../../core/logger';
 import { config } from '../../core/config';
+import { ARI, AriRequestError } from '../../core/ari';
 
 import {
   createAgentSession,
@@ -308,6 +309,36 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
     const softphone = (metadata.softphone || {}) as Record<string, unknown>;
     const fallbackEndpoint =
       (typeof softphone.endpoint === 'string' && softphone.endpoint.trim()) ? softphone.endpoint : config.dialerDefaultAgentEndpoint || null;
+
+    let registrationStatus: 'registered' | 'unregistered' | 'unknown' = 'unknown';
+    let registrationSource: 'ari' | 'none' = 'none';
+    let registrationReason = 'missing_endpoint';
+
+    if (fallbackEndpoint) {
+      const normalized = normalizeAgentEndpoint(fallbackEndpoint);
+      const [technology, ...resourceParts] = normalized.split('/');
+      const resource = resourceParts.join('/');
+
+      if (technology && resource && config.ariUrl && config.ariUsername && config.ariPassword && config.ariApp) {
+        try {
+          const endpoint = await ARI.endpoints.get(technology, resource);
+          const state = String(endpoint?.state || '').toLowerCase();
+          registrationSource = 'ari';
+          registrationReason = state || 'unknown_state';
+          registrationStatus = state === 'online' ? 'registered' : state === 'offline' ? 'unregistered' : 'unknown';
+        } catch (error) {
+          registrationReason =
+            error instanceof AriRequestError ? `ari_http_${error.status}` : 'ari_query_failed';
+          logger.warn(
+            { error, org_id: orgId, user_id: req.user_id, endpoint: normalized },
+            'Failed to verify endpoint registration from ARI',
+          );
+        }
+      } else {
+        registrationReason = 'ari_not_configured';
+      }
+    }
+
     return reply.send({
       agent_id: user.user_id,
       display_name: user.full_name ?? null,
@@ -316,8 +347,14 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
       authorization_username: softphone.authorization_username ?? null,
       password: softphone.password ?? null,
       ws_server: softphone.ws_server ?? null,
+      registration_status: registrationStatus,
+      registration_source: registrationSource,
+      registration_reason: registrationReason,
       metadata: {
         ...(softphone || {}),
+        registration_status: registrationStatus,
+        registration_source: registrationSource,
+        registration_reason: registrationReason,
         ...(fallbackEndpoint && !softphone.endpoint
           ? {
               endpoint: fallbackEndpoint,

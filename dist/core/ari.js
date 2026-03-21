@@ -228,4 +228,12 @@ exports.ARI = {
             });
         },
     },
+    endpoints: {
+        get(technology, resource) {
+            return ariRequest({
+                method: 'GET',
+                path: `/endpoints/${encodeURIComponent(technology)}/${encodeURIComponent(resource)}`,
+            });
+        },
+    },
 };

@@ -28,6 +28,13 @@ export interface AriChannel {
   state?: string;
 }
 
+export interface AriEndpoint {
+  technology?: string;
+  resource?: string;
+  state?: string;
+  channel_ids?: string[];
+}
+
 export class AriRequestError extends Error {
   status: number;
   responseText: string;
@@ -314,6 +321,15 @@ export const ARI = {
       return ariRequest({
         method: 'GET',
         path: `/recordings/stored/${encodeURIComponent(recordingName)}`,
+      });
+    },
+  },
+
+  endpoints: {
+    get(technology: string, resource: string) {
+      return ariRequest<AriEndpoint>({
+        method: 'GET',
+        path: `/endpoints/${encodeURIComponent(technology)}/${encodeURIComponent(resource)}`,
       });
     },
   },

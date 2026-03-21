@@ -32,6 +32,7 @@ exports.dialerModule = void 0;
 const supabase_1 = require("../../core/supabase");
 const logger_1 = require("../../core/logger");
 const config_1 = require("../../core/config");
+const ari_1 = require("../../core/ari");
 const agentState_1 = require("./agentState");
 const amd_1 = require("./amd");
 const orchestrator_1 = require("./orchestrator");
@@ -257,6 +258,31 @@ const dialerModule = async (app) => {
         }
         const softphone = (metadata.softphone || {});
         const fallbackEndpoint = (typeof softphone.endpoint === 'string' && softphone.endpoint.trim()) ? softphone.endpoint : config_1.config.dialerDefaultAgentEndpoint || null;
+        let registrationStatus = 'unknown';
+        let registrationSource = 'none';
+        let registrationReason = 'missing_endpoint';
+        if (fallbackEndpoint) {
+            const normalized = normalizeAgentEndpoint(fallbackEndpoint);
+            const [technology, ...resourceParts] = normalized.split('/');
+            const resource = resourceParts.join('/');
+            if (technology && resource && config_1.config.ariUrl && config_1.config.ariUsername && config_1.config.ariPassword && config_1.config.ariApp) {
+                try {
+                    const endpoint = await ari_1.ARI.endpoints.get(technology, resource);
+                    const state = String(endpoint?.state || '').toLowerCase();
+                    registrationSource = 'ari';
+                    registrationReason = state || 'unknown_state';
+                    registrationStatus = state === 'online' ? 'registered' : state === 'offline' ? 'unregistered' : 'unknown';
+                }
+                catch (error) {
+                    registrationReason =
+                        error instanceof ari_1.AriRequestError ? `ari_http_${error.status}` : 'ari_query_failed';
+                    logger_1.logger.warn({ error, org_id: orgId, user_id: req.user_id, endpoint: normalized }, 'Failed to verify endpoint registration from ARI');
+                }
+            }
+            else {
+                registrationReason = 'ari_not_configured';
+            }
+        }
         return reply.send({
             agent_id: user.user_id,
             display_name: user.full_name ?? null,
@@ -265,8 +291,14 @@ const dialerModule = async (app) => {
             authorization_username: softphone.authorization_username ?? null,
             password: softphone.password ?? null,
             ws_server: softphone.ws_server ?? null,
+            registration_status: registrationStatus,
+            registration_source: registrationSource,
+            registration_reason: registrationReason,
             metadata: {
                 ...(softphone || {}),
+                registration_status: registrationStatus,
+                registration_source: registrationSource,
+                registration_reason: registrationReason,
                 ...(fallbackEndpoint && !softphone.endpoint
                     ? {
                         endpoint: fallbackEndpoint,
