@@ -36,6 +36,24 @@ function activeStatusList(): string[] {
   return [...ACTIVE_PROGRESSIVE_CALL_STATES];
 }
 
+async function updateCallAttempt(
+  call: DialerCallRow,
+  patch: Record<string, unknown>,
+): Promise<void> {
+  const attemptId = stringValue(callMetadata(call).call_attempt_id);
+  if (!attemptId) return;
+
+  const { error } = await supabase
+    .from('dialer_call_attempts')
+    .update({ ...patch, updated_at: new Date().toISOString() })
+    .eq('id', attemptId)
+    .eq('org_id', call.org_id);
+
+  if (error) {
+    logger.warn({ error, call_attempt_id: attemptId, call_id: call.call_id }, 'Failed to update dialer_call_attempts');
+  }
+}
+
 function callMetadata(call: DialerCallRow): Record<string, unknown> {
   return (call.metadata || {}) as Record<string, unknown>;
 }
@@ -353,6 +371,8 @@ export async function handleLeadChannelAnswered(channelId: string): Promise<void
     },
   });
 
+  await updateCallAttempt(call, { answered_at: new Date().toISOString(), system_outcome: 'answered' });
+
   try {
     await ARI.channels.continueInDialplan(channelId, 'dialer-amd', 's', 1);
   } catch (error) {
@@ -490,6 +510,7 @@ export async function processDialerAmdResult(
       await releaseAgentReady(workingCall, 'agent_alert_failed');
       await hangupChannel(leadChannelId);
       await updateCampaignLeadState(workingCall.cl_id, orgId, 'failed');
+      await updateCallAttempt(workingCall, { ended_at: new Date().toISOString(), system_outcome: 'failed' });
       return { action: 'hangup' };
     }
   }
@@ -512,6 +533,9 @@ export async function processDialerAmdResult(
   await hangupChannel(leadChannelId);
   await updateCampaignLeadState(workingCall.cl_id, orgId, result === 'MACHINE' ? 'no_answer' : 'failed');
   await releaseAgentReady(workingCall, result === 'MACHINE' ? 'amd_machine' : 'amd_failed');
+
+  const machineOutcome = result === 'MACHINE' ? 'no_answer' : 'failed';
+  await updateCallAttempt(workingCall, { ended_at: new Date().toISOString(), system_outcome: machineOutcome });
 
   if (result === 'MACHINE') {
     await transitionDialerCallState(workingCall, 'ENDED', {
@@ -616,6 +640,8 @@ export async function finalizeBridgeAfterBeep(playbackId: string): Promise<void>
 
   await updateCampaignLeadState(bridged.cl_id, bridged.org_id, 'answered');
 
+  await updateCallAttempt(bridged, { bridged_at: new Date().toISOString(), system_outcome: 'bridged' });
+
   const leadSnapshot = await hydrateLeadSnapshot(bridged);
   emitCallBridged(bridged, {
     agent_id: bridged.assigned_agent,
@@ -672,6 +698,16 @@ export async function handleCallChannelHangup(channelId: string, reason: string)
 
   if (call.status === 'BRIDGED') {
     const ended = await transitionEndedIfNeeded(call, reason);
+    const now = new Date();
+    const durationSeconds = call.started_at ? Math.round((now.getTime() - new Date(call.started_at).getTime()) / 1000) : null;
+    const bridgeReadyAt = stringValue(metadata.bridge_ready_at);
+    const talkSeconds = bridgeReadyAt ? Math.round((now.getTime() - new Date(bridgeReadyAt).getTime()) / 1000) : null;
+    await updateCallAttempt(call, {
+      ended_at: now.toISOString(),
+      system_outcome: 'completed',
+      duration_seconds: durationSeconds,
+      talk_seconds: talkSeconds,
+    });
     if (isAgentSide) {
       await hangupChannel(leadChannelId);
     } else if (isLeadSide) {
@@ -690,6 +726,9 @@ export async function handleCallChannelHangup(channelId: string, reason: string)
       eventType: 'call.failed',
       eventPayload: { reason, channel_id: channelId },
     }).catch(() => undefined);
+
+    const failOutcome = call.status === 'DIALING_LEAD' ? 'no_answer' : 'failed';
+    await updateCallAttempt(call, { ended_at: new Date().toISOString(), system_outcome: failOutcome });
 
     if (isAgentSide) {
       await hangupChannel(leadChannelId);

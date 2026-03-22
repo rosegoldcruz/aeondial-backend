@@ -265,7 +265,7 @@ async function processDialerJob(job: Job<DialerJobData>): Promise<void> {
     return;
   }
 
-  await transitionDialerCallState(queuedCall, 'DIALING_LEAD', {
+  const dialingCallState = await transitionDialerCallState(queuedCall, 'DIALING_LEAD', {
     eventType: 'queue.lead_dialing',
     metadataPatch: buildDialerCallMetadata({
       session_id: sessionId,
@@ -301,6 +301,43 @@ async function processDialerJob(job: Job<DialerJobData>): Promise<void> {
     .eq('cl_id', cl_id)
     .eq('org_id', org_id);
 
+  // Create dialer_call_attempts row (canonical per-attempt record)
+  const callAttemptId = crypto.randomUUID();
+  const callerIdNumber = await resolveCallerId(org_id, campaign_id);
+  const { error: attemptErr } = await supabase.from('dialer_call_attempts').insert({
+    id: callAttemptId,
+    org_id,
+    campaign_id,
+    lead_id,
+    cl_id,
+    call_id,
+    agent_user_id: agentId,
+    agent_endpoint: endpoint,
+    session_id: sessionId,
+    provider: 'asterisk',
+    to_number: phone,
+    from_number: callerIdNumber ?? null,
+    system_outcome: 'originated',
+  });
+
+  if (attemptErr) {
+    logger.error({ error: attemptErr, call_id, call_attempt_id: callAttemptId }, 'Failed to create dialer_call_attempts row');
+  }
+
+  // Store attempt_id in call metadata for later wrap-up linking
+  await transitionDialerCallState(dialingCallState, 'DIALING_LEAD', {
+    allowSameState: true,
+    eventType: 'attempt.created',
+    metadataPatch: { call_attempt_id: callAttemptId },
+  });
+
+  // Update campaign_leads with active_call_attempt_id
+  await supabase
+    .from('campaign_leads')
+    .update({ active_call_attempt_id: callAttemptId })
+    .eq('cl_id', cl_id)
+    .eq('org_id', org_id);
+
   // 3. Originate via ARI
   let ariChannelId: string;
 
@@ -308,7 +345,7 @@ async function processDialerJob(job: Job<DialerJobData>): Promise<void> {
     const ariChannel = await ARI.channels.originate({
       debugContext: 'dialer.lead',
       endpoint,
-      callerId: await resolveCallerId(org_id, campaign_id),
+      callerId: callerIdNumber,
       channelId: call_id,
       appArgs: `dialer,${call_id},${org_id}`,
       timeout: 30,

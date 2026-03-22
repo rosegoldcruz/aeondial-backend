@@ -23,6 +23,19 @@ const playbackToCall = new Map();
 function activeStatusList() {
     return [...callState_1.ACTIVE_PROGRESSIVE_CALL_STATES];
 }
+async function updateCallAttempt(call, patch) {
+    const attemptId = stringValue(callMetadata(call).call_attempt_id);
+    if (!attemptId)
+        return;
+    const { error } = await supabase_1.supabase
+        .from('dialer_call_attempts')
+        .update({ ...patch, updated_at: new Date().toISOString() })
+        .eq('id', attemptId)
+        .eq('org_id', call.org_id);
+    if (error) {
+        logger_1.logger.warn({ error, call_attempt_id: attemptId, call_id: call.call_id }, 'Failed to update dialer_call_attempts');
+    }
+}
 function callMetadata(call) {
     return (call.metadata || {});
 }
@@ -288,6 +301,7 @@ async function handleLeadChannelAnswered(channelId) {
             amd_started_at: new Date().toISOString(),
         },
     });
+    await updateCallAttempt(call, { answered_at: new Date().toISOString(), system_outcome: 'answered' });
     try {
         await ari_1.ARI.channels.continueInDialplan(channelId, 'dialer-amd', 's', 1);
     }
@@ -411,6 +425,7 @@ async function processDialerAmdResult(callId, orgId, result, cause, durationMs) 
             await releaseAgentReady(workingCall, 'agent_alert_failed');
             await hangupChannel(leadChannelId);
             await updateCampaignLeadState(workingCall.cl_id, orgId, 'failed');
+            await updateCallAttempt(workingCall, { ended_at: new Date().toISOString(), system_outcome: 'failed' });
             return { action: 'hangup' };
         }
     }
@@ -431,6 +446,8 @@ async function processDialerAmdResult(callId, orgId, result, cause, durationMs) 
     await hangupChannel(leadChannelId);
     await updateCampaignLeadState(workingCall.cl_id, orgId, result === 'MACHINE' ? 'no_answer' : 'failed');
     await releaseAgentReady(workingCall, result === 'MACHINE' ? 'amd_machine' : 'amd_failed');
+    const machineOutcome = result === 'MACHINE' ? 'no_answer' : 'failed';
+    await updateCallAttempt(workingCall, { ended_at: new Date().toISOString(), system_outcome: machineOutcome });
     if (result === 'MACHINE') {
         await (0, callState_1.transitionDialerCallState)(workingCall, 'ENDED', {
             eventType: 'call.ended',
@@ -524,6 +541,7 @@ async function finalizeBridgeAfterBeep(playbackId) {
         },
     });
     await updateCampaignLeadState(bridged.cl_id, bridged.org_id, 'answered');
+    await updateCallAttempt(bridged, { bridged_at: new Date().toISOString(), system_outcome: 'bridged' });
     const leadSnapshot = await hydrateLeadSnapshot(bridged);
     emitCallBridged(bridged, {
         agent_id: bridged.assigned_agent,
@@ -575,6 +593,16 @@ async function handleCallChannelHangup(channelId, reason) {
     const isLeadSide = leadChannelId === channelId;
     if (call.status === 'BRIDGED') {
         const ended = await transitionEndedIfNeeded(call, reason);
+        const now = new Date();
+        const durationSeconds = call.started_at ? Math.round((now.getTime() - new Date(call.started_at).getTime()) / 1000) : null;
+        const bridgeReadyAt = stringValue(metadata.bridge_ready_at);
+        const talkSeconds = bridgeReadyAt ? Math.round((now.getTime() - new Date(bridgeReadyAt).getTime()) / 1000) : null;
+        await updateCallAttempt(call, {
+            ended_at: now.toISOString(),
+            system_outcome: 'completed',
+            duration_seconds: durationSeconds,
+            talk_seconds: talkSeconds,
+        });
         if (isAgentSide) {
             await hangupChannel(leadChannelId);
         }
@@ -592,6 +620,8 @@ async function handleCallChannelHangup(channelId, reason) {
             eventType: 'call.failed',
             eventPayload: { reason, channel_id: channelId },
         }).catch(() => undefined);
+        const failOutcome = call.status === 'DIALING_LEAD' ? 'no_answer' : 'failed';
+        await updateCallAttempt(call, { ended_at: new Date().toISOString(), system_outcome: failOutcome });
         if (isAgentSide) {
             await hangupChannel(leadChannelId);
         }

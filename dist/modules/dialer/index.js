@@ -580,11 +580,19 @@ const dialerModule = async (app) => {
             .eq('org_id', orgId)
             .eq('campaign_id', campaign_id)
             .in('dial_state', ['pending', 'callback']);
+        // Live calls for this campaign (active/bridged)
+        const { data: liveCalls } = await supabase_1.supabase
+            .from('calls')
+            .select('call_id, contact_id, lead_id, assigned_agent, status, started_at, metadata')
+            .eq('org_id', orgId)
+            .eq('campaign_id', campaign_id)
+            .in('status', ['DIALING_LEAD', 'ANSWERED', 'AMD_HUMAN', 'BRIDGED', 'dialing', 'originated', 'bridged']);
         return reply.send({
             campaign_id,
             queue: { waiting, active, failed, completed },
             agents: { ready: readyCount ?? 0, incall: incallCount ?? 0 },
             leads: { pending: pendingLeads ?? 0 },
+            live_calls_data: liveCalls ?? [],
         });
     });
     /**
@@ -769,6 +777,152 @@ const dialerModule = async (app) => {
             }).catch(() => undefined);
         }
         return reply.status(201).send({ disposition_id, success: true });
+    });
+    // ────────────────────────────────────────────────────────────────────────────
+    // WRAP-UP (new atomic endpoint using dialer_call_attempts + apply_dialer_wrap_up)
+    // ────────────────────────────────────────────────────────────────────────────
+    /**
+     * POST /dialer/call-attempts/:id/wrap-up
+     * Atomic: disposition + notes + lead summary + queue state in one DB call.
+     */
+    app.post('/call-attempts/:id/wrap-up', async (req, reply) => {
+        const orgId = requireOrg(req, reply);
+        if (!orgId)
+            return;
+        const { id } = req.params;
+        const body = (req.body || {});
+        if (!body.disposition) {
+            return reply.status(400).send({ error: 'disposition is required' });
+        }
+        const VALID = [
+            'no_answer', 'voicemail', 'busy', 'wrong_number', 'bad_number',
+            'do_not_call', 'callback_requested', 'interested', 'not_interested',
+            'qualified', 'appointment_set', 'sale', 'failed', 'abandoned',
+        ];
+        if (!VALID.includes(body.disposition)) {
+            return reply.status(400).send({ error: `Invalid disposition. Must be one of: ${VALID.join(', ')}` });
+        }
+        // Verify attempt belongs to this org
+        const { data: attempt, error: attemptErr } = await supabase_1.supabase
+            .from('dialer_call_attempts')
+            .select('id, org_id')
+            .eq('id', id)
+            .eq('org_id', orgId)
+            .maybeSingle();
+        if (attemptErr)
+            return reply.status(500).send({ error: attemptErr.message });
+        if (!attempt)
+            return reply.status(404).send({ error: 'Call attempt not found' });
+        // Call the atomic wrap-up function
+        const { data, error } = await supabase_1.supabase.rpc('apply_dialer_wrap_up', {
+            p_call_attempt_id: id,
+            p_agent_disposition: body.disposition,
+            p_notes: body.notes ?? null,
+            p_callback_at: body.callback_at ?? null,
+            p_author_user_id: req.user_id ?? null,
+        });
+        if (error)
+            return reply.status(500).send({ error: error.message });
+        // Also mark the old calls row as DISPOSITIONED if there's a linked call_id
+        const { data: attemptRow } = await supabase_1.supabase
+            .from('dialer_call_attempts')
+            .select('call_id')
+            .eq('id', id)
+            .maybeSingle();
+        if (attemptRow?.call_id) {
+            await (0, orchestrator_1.markDispositioned)(attemptRow.call_id, orgId);
+        }
+        // Transition agent WRAP → READY
+        if (body.session_id) {
+            await (0, agentState_1.transitionAgentState)(body.session_id, orgId, 'READY', {
+                reason: 'wrapup_submitted',
+                updatedBy: req.user_id ?? 'system',
+            }).catch(() => undefined);
+        }
+        const result = Array.isArray(data) ? data[0] : data;
+        return reply.status(201).send({ success: true, ...result });
+    });
+    /**
+     * POST /dialer/leads/:lead_id/notes
+     * Add a standalone note to a lead (not tied to wrap-up).
+     */
+    app.post('/leads/:lead_id/notes', async (req, reply) => {
+        const orgId = requireOrg(req, reply);
+        if (!orgId)
+            return;
+        const { lead_id } = req.params;
+        const body = (req.body || {});
+        if (!body.body || !body.body.trim()) {
+            return reply.status(400).send({ error: 'body is required and cannot be blank' });
+        }
+        const VALID_TYPES = ['call_note', 'general_note', 'callback_note', 'manager_note', 'disposition_note'];
+        const noteType = body.note_type && VALID_TYPES.includes(body.note_type) ? body.note_type : 'general_note';
+        const { data, error } = await supabase_1.supabase
+            .from('lead_notes')
+            .insert({
+            org_id: orgId,
+            lead_id,
+            campaign_id: null,
+            call_attempt_id: body.call_attempt_id ?? null,
+            author_user_id: req.user_id ?? 'system',
+            note_type: noteType,
+            body: body.body.trim(),
+            is_pinned: body.is_pinned ?? false,
+        })
+            .select('id, created_at')
+            .single();
+        if (error)
+            return reply.status(500).send({ error: error.message });
+        // Mirror to leads.latest_note
+        await supabase_1.supabase
+            .from('leads')
+            .update({ latest_note: body.body.trim() })
+            .eq('lead_id', lead_id)
+            .eq('org_id', orgId);
+        return reply.status(201).send({ success: true, note_id: data.id, created_at: data.created_at });
+    });
+    /**
+     * GET /dialer/leads/:lead_id/notes
+     * List notes for a lead.
+     */
+    app.get('/leads/:lead_id/notes', async (req, reply) => {
+        const orgId = requireOrg(req, reply);
+        if (!orgId)
+            return;
+        const { lead_id } = req.params;
+        const { limit } = req.query;
+        const safeLimit = Math.min(Number.parseInt(limit ?? '50', 10) || 50, 200);
+        const { data, error } = await supabase_1.supabase
+            .from('lead_notes')
+            .select('id, call_attempt_id, author_user_id, note_type, body, is_pinned, created_at')
+            .eq('org_id', orgId)
+            .eq('lead_id', lead_id)
+            .order('created_at', { ascending: false })
+            .limit(safeLimit);
+        if (error)
+            return reply.status(500).send({ error: error.message });
+        return reply.send(data ?? []);
+    });
+    /**
+     * GET /dialer/call-attempts/:id
+     * Get a single call attempt with full detail.
+     */
+    app.get('/call-attempts/:id', async (req, reply) => {
+        const orgId = requireOrg(req, reply);
+        if (!orgId)
+            return;
+        const { id } = req.params;
+        const { data, error } = await supabase_1.supabase
+            .from('dialer_call_attempts')
+            .select('*')
+            .eq('id', id)
+            .eq('org_id', orgId)
+            .maybeSingle();
+        if (error)
+            return reply.status(500).send({ error: error.message });
+        if (!data)
+            return reply.status(404).send({ error: 'Call attempt not found' });
+        return reply.send(data);
     });
     /** GET /dialer/calls/live – active dialer calls for org */
     app.get('/calls/live', async (req, reply) => {
