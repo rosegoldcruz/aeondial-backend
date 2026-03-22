@@ -90,6 +90,20 @@ function firstNumber(...values) {
     }
     return undefined;
 }
+async function findUserInOtherOrg(userId, orgId) {
+    const { data, error } = await supabase_1.supabase
+        .from('users')
+        .select('user_id, org_id, email')
+        .eq('user_id', userId)
+        .neq('org_id', orgId)
+        .limit(1)
+        .maybeSingle();
+    if (error) {
+        logger_1.logger.warn({ error, user_id: userId, org_id: orgId }, 'Failed to check for cross-org user mapping');
+        return null;
+    }
+    return data || null;
+}
 function coerceRequestBody(body) {
     if (!body)
         return {};
@@ -178,6 +192,17 @@ const dialerModule = async (app) => {
         if (error)
             return reply.status(500).send({ error: error.message });
         if (!user) {
+            const crossOrgUser = await findUserInOtherOrg(req.user_id, orgId);
+            if (crossOrgUser) {
+                return reply.status(409).send({
+                    error: 'User exists in a different org and cannot be resolved for the active org',
+                    code: 'USER_ORG_CONFLICT',
+                    user_id: req.user_id,
+                    active_org_id: orgId,
+                    existing_org_id: crossOrgUser.org_id,
+                    existing_email: crossOrgUser.email ?? null,
+                });
+            }
             const bootstrapEmail = typeof headerEmail === 'string' && headerEmail.trim()
                 ? headerEmail.trim().toLowerCase()
                 : null;
@@ -208,26 +233,22 @@ const dialerModule = async (app) => {
                 .maybeSingle();
             if (seedError) {
                 logger_1.logger.error({ err: seedError, org_id: orgId, user_id: req.user_id }, 'Failed to bootstrap Clerk-linked user');
+                return reply.status(409).send({
+                    error: 'Failed to create or resolve the active-org user row',
+                    code: 'USER_BOOTSTRAP_FAILED',
+                    details: seedError.message,
+                    user_id: req.user_id,
+                    org_id: orgId,
+                });
             }
             user = seededUser || null;
         }
         if (!user) {
-            const fallbackEndpoint = config_1.config.dialerDefaultAgentEndpoint || null;
-            return reply.send({
-                agent_id: req.user_id,
-                display_name: null,
-                endpoint: fallbackEndpoint,
-                sip_uri: null,
-                authorization_username: null,
-                password: null,
-                ws_server: null,
-                metadata: fallbackEndpoint
-                    ? {
-                        endpoint: fallbackEndpoint,
-                        transport: config_1.config.dialerDefaultAgentTransport,
-                        host: config_1.config.dialerDefaultAgentHost || null,
-                    }
-                    : {},
+            return reply.status(404).send({
+                error: 'No user row exists for the active user and org',
+                code: 'USER_ROW_MISSING',
+                user_id: req.user_id,
+                org_id: orgId,
             });
         }
         let metadata = (user.metadata || {});
