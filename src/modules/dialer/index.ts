@@ -1151,6 +1151,174 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
   });
 
   // ────────────────────────────────────────────────────────────────────────────
+  // ACTIVE CALL CONTEXT (agent-facing)
+  // ────────────────────────────────────────────────────────────────────────────
+
+  /**
+   * GET /dialer/agents/self/active-call
+   * Returns the current active lead + call attempt context for the signed-in agent.
+   * Polled by the CRM dialer UI every 2s.
+   */
+  app.get('/agents/self/active-call', async (req, reply) => {
+    const orgId = requireOrg(req, reply);
+    if (!orgId) return;
+    const userId = req.user_id;
+    if (!userId) return reply.status(401).send({ error: 'Missing user scope' });
+
+    // 1. Find the agent's active session
+    const { data: session } = await supabase
+      .from('agent_sessions')
+      .select('session_id, state, campaign_id, metadata')
+      .eq('org_id', orgId)
+      .eq('agent_id', userId)
+      .is('ended_at', null)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const sessionId = session?.session_id ?? null;
+    const campaignId = session?.campaign_id ?? null;
+
+    // 2. Find the latest call attempt for this agent that is still active
+    //    (ended_at IS NULL) or very recently ended (within last 60s for wrap-up)
+    const sixtySecondsAgo = new Date(Date.now() - 60_000).toISOString();
+
+    const { data: attempt } = await supabase
+      .from('dialer_call_attempts')
+      .select('*')
+      .eq('org_id', orgId)
+      .eq('agent_user_id', userId)
+      .or(`ended_at.is.null,ended_at.gte.${sixtySecondsAgo}`)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!attempt) {
+      return reply.send({
+        has_active_call: false,
+        agent_user_id: userId,
+        session_id: sessionId,
+        campaign: null,
+        lead: null,
+        call_attempt: null,
+        queue: null,
+      });
+    }
+
+    // 3. Fetch campaign name
+    let campaignName: string | null = null;
+    const aCampaignId = attempt.campaign_id || campaignId;
+    if (aCampaignId) {
+      const { data: camp } = await supabase
+        .from('campaigns')
+        .select('name')
+        .eq('campaign_id', aCampaignId)
+        .maybeSingle();
+      campaignName = camp?.name ?? null;
+    }
+
+    // 4. Fetch lead + contact for name/phone
+    let leadData: Record<string, unknown> | null = null;
+    let contactName: string | null = null;
+    if (attempt.lead_id) {
+      const { data: lead } = await supabase
+        .from('leads')
+        .select('lead_id, status, metadata, latest_note, last_agent_disposition, callback_at, do_not_call, attempt_count')
+        .eq('lead_id', attempt.lead_id)
+        .eq('org_id', orgId)
+        .maybeSingle();
+      leadData = lead;
+
+      // Try to get contact name from contacts table
+      const { data: contacts } = await supabase
+        .from('contacts')
+        .select('first_name, last_name, phone')
+        .eq('lead_id', attempt.lead_id)
+        .eq('org_id', orgId)
+        .limit(1);
+      if (contacts && contacts.length > 0) {
+        contactName = [contacts[0].first_name, contacts[0].last_name].filter(Boolean).join(' ') || null;
+      }
+    }
+
+    // 5. Fetch campaign_leads queue context
+    let queueData: Record<string, unknown> | null = null;
+    if (attempt.cl_id) {
+      const { data: cl } = await supabase
+        .from('campaign_leads')
+        .select('dial_state, attempts, max_attempts, next_retry_at, is_callable, last_disposition, callback_at')
+        .eq('cl_id', attempt.cl_id)
+        .eq('org_id', orgId)
+        .maybeSingle();
+      queueData = cl;
+    }
+
+    // Derive lead name from contacts or lead metadata
+    const leadMeta = (leadData?.metadata || {}) as Record<string, unknown>;
+    const leadName = contactName
+      || (typeof leadMeta.lead_name === 'string' ? leadMeta.lead_name : null)
+      || (typeof leadMeta.name === 'string' ? leadMeta.name : null);
+    const nameParts = leadName ? leadName.split(' ') : [];
+    const firstName = nameParts[0] || null;
+    const lastName = nameParts.slice(1).join(' ') || null;
+
+    // Derive call state from system_outcome + ended_at
+    let callState = attempt.system_outcome || 'queued';
+    if (!attempt.ended_at) {
+      if (attempt.bridged_at) callState = 'bridged';
+      else if (attempt.answered_at) callState = 'answered';
+      else callState = 'dialing';
+    } else {
+      if (attempt.system_outcome === 'completed') callState = 'completed';
+      else if (attempt.system_outcome) callState = attempt.system_outcome;
+      else callState = 'completed';
+    }
+
+    return reply.send({
+      has_active_call: true,
+      agent_user_id: userId,
+      session_id: sessionId,
+      campaign: {
+        id: aCampaignId,
+        name: campaignName,
+      },
+      lead: {
+        id: attempt.lead_id,
+        first_name: firstName,
+        last_name: lastName,
+        phone: attempt.to_number || (typeof leadMeta.phone === 'string' ? leadMeta.phone : null),
+        status: (leadData?.status as string) ?? null,
+        latest_note: (leadData?.latest_note as string) ?? null,
+        last_agent_disposition: (leadData?.last_agent_disposition as string) ?? null,
+        callback_at: (leadData?.callback_at as string) ?? null,
+        do_not_call: (leadData?.do_not_call as boolean) ?? false,
+        attempt_count: (leadData?.attempt_count as number) ?? 0,
+      },
+      call_attempt: {
+        id: attempt.id,
+        call_id: attempt.call_id,
+        state: callState,
+        system_outcome: attempt.system_outcome,
+        agent_disposition: attempt.agent_disposition,
+        started_at: attempt.created_at,
+        answered_at: attempt.answered_at,
+        bridged_at: attempt.bridged_at,
+        ended_at: attempt.ended_at,
+        duration_seconds: attempt.duration_seconds,
+        talk_seconds: attempt.talk_seconds,
+      },
+      queue: queueData ? {
+        dial_state: (queueData.dial_state as string) ?? null,
+        attempt_count: (queueData.attempts as number) ?? 0,
+        max_attempts: (queueData.max_attempts as number) ?? 3,
+        next_retry_at: (queueData.next_retry_at as string) ?? null,
+        is_callable: (queueData.is_callable as boolean) ?? true,
+        callback_at: (queueData.callback_at as string) ?? null,
+      } : null,
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
   // SUPERVISOR
   // ────────────────────────────────────────────────────────────────────────────
 
