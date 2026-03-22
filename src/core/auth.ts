@@ -2,6 +2,7 @@ import { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import jwt from 'jsonwebtoken';
 import { supabase } from './supabase';
 import { config } from './config';
+import { logger } from './logger';
 
 type Role = 'owner' | 'admin' | 'agent';
 
@@ -100,6 +101,70 @@ function bypassTenantContext(path: string): boolean {
   return PUBLIC_PATHS.has(path) || INTERNAL_CALLBACK_PATHS.some((pattern) => pattern.test(path));
 }
 
+function firstHeaderValue(value: string | string[] | undefined): string | undefined {
+  if (Array.isArray(value)) {
+    const candidate = value.find((entry) => typeof entry === 'string' && entry.trim());
+    return candidate?.trim();
+  }
+
+  if (typeof value === 'string' && value.trim()) {
+    return value.trim();
+  }
+
+  return undefined;
+}
+
+async function ensureOrgExists(req: FastifyRequest, reply: FastifyReply): Promise<boolean> {
+  const { data: org, error } = await supabase
+    .from('orgs')
+    .select('org_id')
+    .eq('org_id', req.org_id)
+    .maybeSingle();
+
+  if (error) {
+    await reply.status(500).send({ error: error.message });
+    return false;
+  }
+
+  if (org) {
+    return true;
+  }
+
+  const orgSlug = firstHeaderValue(req.headers['x-org-slug']) || null;
+  const orgName = firstHeaderValue(req.headers['x-org-name']) || orgSlug || req.org_id || 'Unknown organization';
+
+  const { error: bootstrapError } = await supabase
+    .from('orgs')
+    .upsert(
+      {
+        org_id: req.org_id,
+        name: orgName,
+        status: 'active',
+        metadata: {
+          identity_provider: 'clerk',
+          bootstrap_source: 'auth.requireTenantContext',
+          clerk: {
+            org_id: req.org_id,
+            org_slug: orgSlug,
+          },
+        },
+        created_by: req.user_id,
+        updated_by: req.user_id,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'org_id' },
+    );
+
+  if (bootstrapError) {
+    logger.error({ err: bootstrapError, org_id: req.org_id, user_id: req.user_id }, 'Failed to auto-bootstrap org scope');
+    await reply.status(500).send({ error: bootstrapError.message });
+    return false;
+  }
+
+  logger.info({ org_id: req.org_id, user_id: req.user_id, org_slug: orgSlug }, 'Auto-bootstrapped org from authenticated scope');
+  return true;
+}
+
 export async function requireTenantContext(
   req: FastifyRequest,
   reply: FastifyReply,
@@ -127,20 +192,7 @@ export async function requireTenantContext(
     }
   }
 
-  // Validate org exists in Supabase.
-  const { data: org, error } = await supabase
-    .from('orgs')
-    .select('org_id')
-    .eq('org_id', req.org_id)
-    .maybeSingle();
-
-  if (error) {
-    await reply.status(500).send({ error: error.message });
-    return;
-  }
-
-  if (!org) {
-    await reply.status(403).send({ error: 'Unknown org_id' });
+  if (!(await ensureOrgExists(req, reply))) {
     return;
   }
 

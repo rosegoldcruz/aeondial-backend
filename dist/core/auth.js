@@ -8,6 +8,7 @@ exports.requireTenantContext = requireTenantContext;
 const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
 const supabase_1 = require("./supabase");
 const config_1 = require("./config");
+const logger_1 = require("./logger");
 const authPlugin = async (app) => {
     app.decorateRequest('org_id', '');
     app.decorateRequest('user_id', '');
@@ -81,6 +82,57 @@ function isAgentWriteAllowed(path) {
 function bypassTenantContext(path) {
     return PUBLIC_PATHS.has(path) || INTERNAL_CALLBACK_PATHS.some((pattern) => pattern.test(path));
 }
+function firstHeaderValue(value) {
+    if (Array.isArray(value)) {
+        const candidate = value.find((entry) => typeof entry === 'string' && entry.trim());
+        return candidate?.trim();
+    }
+    if (typeof value === 'string' && value.trim()) {
+        return value.trim();
+    }
+    return undefined;
+}
+async function ensureOrgExists(req, reply) {
+    const { data: org, error } = await supabase_1.supabase
+        .from('orgs')
+        .select('org_id')
+        .eq('org_id', req.org_id)
+        .maybeSingle();
+    if (error) {
+        await reply.status(500).send({ error: error.message });
+        return false;
+    }
+    if (org) {
+        return true;
+    }
+    const orgSlug = firstHeaderValue(req.headers['x-org-slug']) || null;
+    const orgName = firstHeaderValue(req.headers['x-org-name']) || orgSlug || req.org_id || 'Unknown organization';
+    const { error: bootstrapError } = await supabase_1.supabase
+        .from('orgs')
+        .upsert({
+        org_id: req.org_id,
+        name: orgName,
+        status: 'active',
+        metadata: {
+            identity_provider: 'clerk',
+            bootstrap_source: 'auth.requireTenantContext',
+            clerk: {
+                org_id: req.org_id,
+                org_slug: orgSlug,
+            },
+        },
+        created_by: req.user_id,
+        updated_by: req.user_id,
+        updated_at: new Date().toISOString(),
+    }, { onConflict: 'org_id' });
+    if (bootstrapError) {
+        logger_1.logger.error({ err: bootstrapError, org_id: req.org_id, user_id: req.user_id }, 'Failed to auto-bootstrap org scope');
+        await reply.status(500).send({ error: bootstrapError.message });
+        return false;
+    }
+    logger_1.logger.info({ org_id: req.org_id, user_id: req.user_id, org_slug: orgSlug }, 'Auto-bootstrapped org from authenticated scope');
+    return true;
+}
 async function requireTenantContext(req, reply) {
     const path = req.url.split('?')[0];
     if (bypassTenantContext(path)) {
@@ -101,18 +153,7 @@ async function requireTenantContext(req, reply) {
             return;
         }
     }
-    // Validate org exists in Supabase.
-    const { data: org, error } = await supabase_1.supabase
-        .from('orgs')
-        .select('org_id')
-        .eq('org_id', req.org_id)
-        .maybeSingle();
-    if (error) {
-        await reply.status(500).send({ error: error.message });
-        return;
-    }
-    if (!org) {
-        await reply.status(403).send({ error: 'Unknown org_id' });
+    if (!(await ensureOrgExists(req, reply))) {
         return;
     }
     // Reject cross-tenant attempts when route payload/query includes org_id.
