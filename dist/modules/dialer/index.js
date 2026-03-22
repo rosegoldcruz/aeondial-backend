@@ -1186,12 +1186,15 @@ const dialerModule = async (app) => {
         if (!userId)
             return reply.status(401).send({ error: 'Missing user scope' });
         // Find latest ended call attempt with wrap_up_status = 'pending'
+        // Only return wrap-ups from the last 30 minutes to prevent stale cross-session wrap-ups
+        const wrapUpCutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
         const { data: attempt } = await supabase_1.supabase
             .from('dialer_call_attempts')
             .select('*')
             .eq('org_id', orgId)
             .eq('agent_user_id', userId)
             .not('ended_at', 'is', null)
+            .gte('ended_at', wrapUpCutoff)
             .eq('wrap_up_status', 'pending')
             .order('ended_at', { ascending: false })
             .limit(1)

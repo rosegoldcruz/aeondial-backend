@@ -292,12 +292,12 @@ create or replace function public.apply_dialer_wrap_up(
   p_author_user_id text default null
 )
 returns table (
-  call_attempt_id uuid,
-  lead_id text,
-  campaign_id text,
-  saved_disposition text,
-  saved_callback_at timestamptz,
-  note_id uuid
+  out_call_attempt_id uuid,
+  out_lead_id text,
+  out_campaign_id text,
+  out_saved_disposition text,
+  out_saved_callback_at timestamptz,
+  out_note_id uuid
 )
 language plpgsql
 security definer

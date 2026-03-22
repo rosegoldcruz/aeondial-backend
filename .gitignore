@@ -23,6 +23,7 @@ credentials/
 *.keystore
 *service-account*.json
 *oauth*client*secret*.json
+fix-wrapup-fn.js
 
 # Build artifacts
 coverage/
