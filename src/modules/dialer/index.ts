@@ -106,7 +106,7 @@ function firstNumber(...values: unknown[]): number | undefined {
 async function findUserInOtherOrg(userId: string, orgId: string) {
   const { data, error } = await supabase
     .from('users')
-    .select('user_id, org_id, email')
+    .select('user_id, org_id, email, full_name, role, status, metadata')
     .eq('user_id', userId)
     .neq('org_id', orgId)
     .limit(1)
@@ -116,6 +116,89 @@ async function findUserInOtherOrg(userId: string, orgId: string) {
     logger.warn({ error, user_id: userId, org_id: orgId }, 'Failed to check for cross-org user mapping');
     return null;
   }
+
+  return data || null;
+}
+
+function canReconcileLegacyUser(crossOrgUser: Record<string, unknown> | null): boolean {
+  if (!crossOrgUser) return false;
+  if (crossOrgUser.org_id === 'default-tenant') return true;
+
+  const metadata = crossOrgUser.metadata;
+  if (!metadata || typeof metadata !== 'object') return false;
+  return (metadata as Record<string, unknown>).identity_provider === 'clerk';
+}
+
+async function reconcileLegacyUserToActiveOrg(args: {
+  userId: string;
+  activeOrgId: string;
+  activeEmail: string;
+  activeName: string | null;
+  desiredSoftphone: { endpoint: string | null; transport: string; host: string | null };
+  crossOrgUser: Record<string, unknown>;
+}) {
+  const { userId, activeOrgId, activeEmail, activeName, desiredSoftphone, crossOrgUser } = args;
+  const metadata =
+    crossOrgUser.metadata && typeof crossOrgUser.metadata === 'object'
+      ? { ...(crossOrgUser.metadata as Record<string, unknown>) }
+      : {};
+  const existingSoftphone =
+    metadata.softphone && typeof metadata.softphone === 'object'
+      ? { ...(metadata.softphone as Record<string, unknown>) }
+      : {};
+  const reconciledAt = new Date().toISOString();
+
+  const mergedMetadata = {
+    ...metadata,
+    identity_provider: 'clerk',
+    reconciled_from_org_id: crossOrgUser.org_id,
+    reconciled_at: reconciledAt,
+    softphone: {
+      ...existingSoftphone,
+      endpoint:
+        (typeof existingSoftphone.endpoint === 'string' && existingSoftphone.endpoint.trim())
+          ? existingSoftphone.endpoint
+          : desiredSoftphone.endpoint,
+      transport:
+        (typeof existingSoftphone.transport === 'string' && existingSoftphone.transport.trim())
+          ? existingSoftphone.transport
+          : desiredSoftphone.transport,
+      host:
+        (typeof existingSoftphone.host === 'string' && existingSoftphone.host.trim())
+          ? existingSoftphone.host
+          : desiredSoftphone.host,
+    },
+  };
+
+  const { data, error } = await supabase
+    .from('users')
+    .update({
+      org_id: activeOrgId,
+      email: activeEmail,
+      full_name: activeName || (typeof crossOrgUser.full_name === 'string' ? crossOrgUser.full_name : null),
+      role: typeof crossOrgUser.role === 'string' ? crossOrgUser.role : 'agent',
+      status: typeof crossOrgUser.status === 'string' ? crossOrgUser.status : 'active',
+      metadata: mergedMetadata,
+      updated_by: userId,
+      updated_at: reconciledAt,
+    })
+    .eq('user_id', userId)
+    .eq('org_id', String(crossOrgUser.org_id))
+    .select('user_id, full_name, metadata')
+    .maybeSingle();
+
+  if (error) {
+    logger.error(
+      { err: error, user_id: userId, active_org_id: activeOrgId, existing_org_id: crossOrgUser.org_id },
+      'Failed to reconcile legacy Clerk user into active org',
+    );
+    return null;
+  }
+
+  logger.info(
+    { user_id: userId, active_org_id: activeOrgId, existing_org_id: crossOrgUser.org_id },
+    'Reconciled legacy Clerk user into active org',
+  );
 
   return data || null;
 }
@@ -231,18 +314,6 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
     if (error) return reply.status(500).send({ error: error.message });
 
     if (!user) {
-      const crossOrgUser = await findUserInOtherOrg(req.user_id, orgId);
-      if (crossOrgUser) {
-        return reply.status(409).send({
-          error: 'User exists in a different org and cannot be resolved for the active org',
-          code: 'USER_ORG_CONFLICT',
-          user_id: req.user_id,
-          active_org_id: orgId,
-          existing_org_id: crossOrgUser.org_id,
-          existing_email: crossOrgUser.email ?? null,
-        });
-      }
-
       const bootstrapEmail =
         typeof headerEmail === 'string' && headerEmail.trim()
           ? headerEmail.trim().toLowerCase()
@@ -256,42 +327,76 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
         return reply.status(401).send({ error: 'Missing authenticated user identity (x-user-email)' });
       }
 
-      const { data: seededUser, error: seedError } = await supabase
-        .from('users')
-        .upsert(
-          {
+      const crossOrgUser = await findUserInOtherOrg(req.user_id, orgId);
+      if (crossOrgUser) {
+        if (canReconcileLegacyUser(crossOrgUser as Record<string, unknown>)) {
+          const reconciledUser = await reconcileLegacyUserToActiveOrg({
+            userId: req.user_id,
+            activeOrgId: orgId,
+            activeEmail: bootstrapEmail,
+            activeName: bootstrapName,
+            desiredSoftphone,
+            crossOrgUser: crossOrgUser as Record<string, unknown>,
+          });
+
+          if (reconciledUser) {
+            user = reconciledUser;
+          }
+        }
+
+        if (!user) {
+          return reply.status(409).send({
+            error: 'User exists in a different org and cannot be resolved for the active org',
+            code: 'USER_ORG_CONFLICT',
             user_id: req.user_id,
-            org_id: orgId,
-            email: bootstrapEmail,
-            full_name: bootstrapName,
-            role: 'agent',
-            status: 'active',
-            metadata: {
-              softphone: desiredSoftphone,
-              identity_provider: 'clerk',
-            },
-            created_by: req.user_id,
-            updated_by: req.user_id,
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: 'user_id' },
-        )
-        .select('user_id, full_name, metadata')
-        .maybeSingle();
-
-      if (seedError) {
-        logger.error({ err: seedError, org_id: orgId, user_id: req.user_id }, 'Failed to bootstrap Clerk-linked user');
-
-        return reply.status(409).send({
-          error: 'Failed to create or resolve the active-org user row',
-          code: 'USER_BOOTSTRAP_FAILED',
-          details: seedError.message,
-          user_id: req.user_id,
-          org_id: orgId,
-        });
+            active_org_id: orgId,
+            existing_org_id: crossOrgUser.org_id,
+            existing_email: crossOrgUser.email ?? null,
+          });
+        }
       }
 
-      user = seededUser || null;
+      if (user) {
+        // Reconciliation succeeded; skip bootstrap upsert.
+      } else {
+
+        const { data: seededUser, error: seedError } = await supabase
+          .from('users')
+          .upsert(
+            {
+              user_id: req.user_id,
+              org_id: orgId,
+              email: bootstrapEmail,
+              full_name: bootstrapName,
+              role: 'agent',
+              status: 'active',
+              metadata: {
+                softphone: desiredSoftphone,
+                identity_provider: 'clerk',
+              },
+              created_by: req.user_id,
+              updated_by: req.user_id,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'user_id' },
+          )
+          .select('user_id, full_name, metadata')
+          .maybeSingle();
+
+        if (seedError) {
+          logger.error({ err: seedError, org_id: orgId, user_id: req.user_id }, 'Failed to bootstrap Clerk-linked user');
+
+          return reply.status(409).send({
+            error: 'Failed to create or resolve the active-org user row',
+            code: 'USER_BOOTSTRAP_FAILED',
+            details: seedError.message,
+            user_id: req.user_id,
+            org_id: orgId,
+          });
+        }
+
+        user = seededUser || null;
+      }
     }
 
     if (!user) {
