@@ -791,7 +791,8 @@ const dialerModule = async (app) => {
             return;
         const { id } = req.params;
         const body = (req.body || {});
-        if (!body.disposition) {
+        const disposition = body.disposition || body.agent_disposition;
+        if (!disposition) {
             return reply.status(400).send({ error: 'disposition is required' });
         }
         const VALID = [
@@ -799,7 +800,7 @@ const dialerModule = async (app) => {
             'do_not_call', 'callback_requested', 'interested', 'not_interested',
             'qualified', 'appointment_set', 'sale', 'failed', 'abandoned',
         ];
-        if (!VALID.includes(body.disposition)) {
+        if (!VALID.includes(disposition)) {
             return reply.status(400).send({ error: `Invalid disposition. Must be one of: ${VALID.join(', ')}` });
         }
         // Verify attempt belongs to this org
@@ -816,7 +817,7 @@ const dialerModule = async (app) => {
         // Call the atomic wrap-up function
         const { data, error } = await supabase_1.supabase.rpc('apply_dialer_wrap_up', {
             p_call_attempt_id: id,
-            p_agent_disposition: body.disposition,
+            p_agent_disposition: disposition,
             p_notes: body.notes ?? null,
             p_callback_at: body.callback_at ?? null,
             p_author_user_id: req.user_id ?? null,
@@ -945,6 +946,337 @@ const dialerModule = async (app) => {
         if (error)
             return reply.status(500).send({ error: error.message });
         return reply.send(data ?? []);
+    });
+    // ────────────────────────────────────────────────────────────────────────────
+    // ACTIVE CALL CONTEXT (agent-facing)
+    // ────────────────────────────────────────────────────────────────────────────
+    /**
+     * GET /dialer/agents/self/active-call
+     * Returns the current active lead + call attempt context for the signed-in agent.
+     * Polled by the CRM dialer UI every 2s.
+     */
+    app.get('/agents/self/active-call', async (req, reply) => {
+        const orgId = requireOrg(req, reply);
+        if (!orgId)
+            return;
+        const userId = req.user_id;
+        if (!userId)
+            return reply.status(401).send({ error: 'Missing user scope' });
+        // 1. Find the agent's active session
+        const { data: session } = await supabase_1.supabase
+            .from('agent_sessions')
+            .select('session_id, state, campaign_id, metadata')
+            .eq('org_id', orgId)
+            .eq('agent_id', userId)
+            .is('ended_at', null)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+        const sessionId = session?.session_id ?? null;
+        const campaignId = session?.campaign_id ?? null;
+        // 2. Find the latest call attempt for this agent that is still active (ended_at IS NULL)
+        const { data: attempt } = await supabase_1.supabase
+            .from('dialer_call_attempts')
+            .select('*')
+            .eq('org_id', orgId)
+            .eq('agent_user_id', userId)
+            .is('ended_at', null)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+        if (!attempt) {
+            return reply.send({
+                has_active_call: false,
+                agent_user_id: userId,
+                session_id: sessionId,
+                campaign: null,
+                lead: null,
+                call_attempt: null,
+                queue: null,
+            });
+        }
+        // 3. Fetch campaign name
+        let campaignName = null;
+        const aCampaignId = attempt.campaign_id || campaignId;
+        if (aCampaignId) {
+            const { data: camp } = await supabase_1.supabase
+                .from('campaigns')
+                .select('name')
+                .eq('campaign_id', aCampaignId)
+                .maybeSingle();
+            campaignName = camp?.name ?? null;
+        }
+        // 4. Fetch lead + contact for name/phone
+        let leadData = null;
+        let contactName = null;
+        if (attempt.lead_id) {
+            const { data: lead } = await supabase_1.supabase
+                .from('leads')
+                .select('lead_id, status, metadata, latest_note, last_agent_disposition, callback_at, do_not_call, attempt_count')
+                .eq('lead_id', attempt.lead_id)
+                .eq('org_id', orgId)
+                .maybeSingle();
+            leadData = lead;
+            // Try to get contact name from contacts table
+            const { data: contacts } = await supabase_1.supabase
+                .from('contacts')
+                .select('first_name, last_name, phone')
+                .eq('lead_id', attempt.lead_id)
+                .eq('org_id', orgId)
+                .limit(1);
+            if (contacts && contacts.length > 0) {
+                contactName = [contacts[0].first_name, contacts[0].last_name].filter(Boolean).join(' ') || null;
+            }
+        }
+        // 5. Fetch campaign_leads queue context
+        let queueData = null;
+        if (attempt.cl_id) {
+            const { data: cl } = await supabase_1.supabase
+                .from('campaign_leads')
+                .select('dial_state, attempts, max_attempts, next_retry_at, is_callable, last_disposition, callback_at')
+                .eq('cl_id', attempt.cl_id)
+                .eq('org_id', orgId)
+                .maybeSingle();
+            queueData = cl;
+        }
+        // Derive lead name from contacts or lead metadata
+        const leadMeta = (leadData?.metadata || {});
+        const leadName = contactName
+            || (typeof leadMeta.lead_name === 'string' ? leadMeta.lead_name : null)
+            || (typeof leadMeta.name === 'string' ? leadMeta.name : null);
+        const nameParts = leadName ? leadName.split(' ') : [];
+        const firstName = nameParts[0] || null;
+        const lastName = nameParts.slice(1).join(' ') || null;
+        // Derive call state from system_outcome + ended_at
+        let callState = attempt.system_outcome || 'queued';
+        if (!attempt.ended_at) {
+            if (attempt.bridged_at)
+                callState = 'bridged';
+            else if (attempt.answered_at)
+                callState = 'answered';
+            else
+                callState = 'dialing';
+        }
+        else {
+            if (attempt.system_outcome === 'completed')
+                callState = 'completed';
+            else if (attempt.system_outcome)
+                callState = attempt.system_outcome;
+            else
+                callState = 'completed';
+        }
+        return reply.send({
+            has_active_call: true,
+            agent_user_id: userId,
+            session_id: sessionId,
+            campaign: {
+                id: aCampaignId,
+                name: campaignName,
+            },
+            lead: {
+                id: attempt.lead_id,
+                first_name: firstName,
+                last_name: lastName,
+                phone: attempt.to_number || (typeof leadMeta.phone === 'string' ? leadMeta.phone : null),
+                status: leadData?.status ?? null,
+                latest_note: leadData?.latest_note ?? null,
+                last_agent_disposition: leadData?.last_agent_disposition ?? null,
+                callback_at: leadData?.callback_at ?? null,
+                do_not_call: leadData?.do_not_call ?? false,
+                attempt_count: leadData?.attempt_count ?? 0,
+            },
+            call_attempt: {
+                id: attempt.id,
+                call_id: attempt.call_id,
+                state: callState,
+                system_outcome: attempt.system_outcome,
+                agent_disposition: attempt.agent_disposition,
+                started_at: attempt.created_at,
+                answered_at: attempt.answered_at,
+                bridged_at: attempt.bridged_at,
+                ended_at: attempt.ended_at,
+                duration_seconds: attempt.duration_seconds,
+                talk_seconds: attempt.talk_seconds,
+            },
+            queue: queueData ? {
+                dial_state: queueData.dial_state ?? null,
+                attempt_count: queueData.attempts ?? 0,
+                max_attempts: queueData.max_attempts ?? 3,
+                next_retry_at: queueData.next_retry_at ?? null,
+                is_callable: queueData.is_callable ?? true,
+                callback_at: queueData.callback_at ?? null,
+            } : null,
+        });
+    });
+    // ────────────────────────────────────────────────────────────────────────────
+    // AGENT HANGUP
+    // ────────────────────────────────────────────────────────────────────────────
+    /**
+     * POST /dialer/agents/self/hangup
+     * Agent-initiated hangup. Looks up the active call, hangs up both channel legs via ARI.
+     * State transitions are handled by the ARI hangup event (handleCallChannelHangup).
+     */
+    app.post('/agents/self/hangup', async (req, reply) => {
+        const orgId = requireOrg(req, reply);
+        if (!orgId)
+            return;
+        const userId = req.user_id;
+        if (!userId)
+            return reply.status(401).send({ error: 'Missing user scope' });
+        // Find the agent's active call attempt (ended_at IS NULL)
+        const { data: attempt } = await supabase_1.supabase
+            .from('dialer_call_attempts')
+            .select('id, call_id, org_id, provider_channel_id, provider_bridge_id')
+            .eq('org_id', orgId)
+            .eq('agent_user_id', userId)
+            .is('ended_at', null)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+        if (!attempt) {
+            return reply.status(404).send({ error: 'No active call to hang up' });
+        }
+        // Get channel IDs from the calls table metadata
+        const callId = attempt.call_id;
+        let leadChannelId = null;
+        let agentChannelId = null;
+        if (callId) {
+            const call = await (0, orchestrator_1.findCallByChannelId)(callId);
+            if (call) {
+                const meta = (call.metadata || {});
+                leadChannelId = (typeof meta.lead_channel_id === 'string' ? meta.lead_channel_id : null) || callId;
+                agentChannelId = typeof meta.agent_channel_id === 'string' ? meta.agent_channel_id : null;
+            }
+        }
+        // Hang up both channel legs via ARI — the ARI hangup event will handle state transitions
+        const hungUp = [];
+        for (const chId of [agentChannelId, leadChannelId]) {
+            if (!chId)
+                continue;
+            try {
+                await ari_1.ARI.channels.hangup(chId);
+                hungUp.push(chId);
+            }
+            catch {
+                // Channel may already be gone
+            }
+        }
+        // If no ARI channels were found, still mark the attempt as ended
+        if (hungUp.length === 0 && attempt.id) {
+            await supabase_1.supabase
+                .from('dialer_call_attempts')
+                .update({ ended_at: new Date().toISOString(), system_outcome: 'completed' })
+                .eq('id', attempt.id)
+                .eq('org_id', orgId);
+        }
+        return reply.send({ success: true, hung_up: hungUp });
+    });
+    // ────────────────────────────────────────────────────────────────────────────
+    // WRAP-UP CONTEXT (agent-facing)
+    // ────────────────────────────────────────────────────────────────────────────
+    /**
+     * GET /dialer/agents/self/wrap-up
+     * Returns the most recent call attempt needing wrap-up (ended but not dispositioned).
+     */
+    app.get('/agents/self/wrap-up', async (req, reply) => {
+        const orgId = requireOrg(req, reply);
+        if (!orgId)
+            return;
+        const userId = req.user_id;
+        if (!userId)
+            return reply.status(401).send({ error: 'Missing user scope' });
+        // Find latest ended call attempt with wrap_up_status = 'pending'
+        const { data: attempt } = await supabase_1.supabase
+            .from('dialer_call_attempts')
+            .select('*')
+            .eq('org_id', orgId)
+            .eq('agent_user_id', userId)
+            .not('ended_at', 'is', null)
+            .eq('wrap_up_status', 'pending')
+            .order('ended_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+        if (!attempt) {
+            return reply.send({ has_wrap_up: false });
+        }
+        // Fetch lead context
+        let leadData = null;
+        let contactName = null;
+        if (attempt.lead_id) {
+            const { data: lead } = await supabase_1.supabase
+                .from('leads')
+                .select('lead_id, status, metadata, latest_note, last_agent_disposition, callback_at, do_not_call, attempt_count')
+                .eq('lead_id', attempt.lead_id)
+                .eq('org_id', orgId)
+                .maybeSingle();
+            leadData = lead;
+            const { data: contacts } = await supabase_1.supabase
+                .from('contacts')
+                .select('first_name, last_name, phone')
+                .eq('lead_id', attempt.lead_id)
+                .eq('org_id', orgId)
+                .limit(1);
+            if (contacts && contacts.length > 0) {
+                contactName = [contacts[0].first_name, contacts[0].last_name].filter(Boolean).join(' ') || null;
+            }
+        }
+        // Campaign name
+        let campaignName = null;
+        if (attempt.campaign_id) {
+            const { data: camp } = await supabase_1.supabase
+                .from('campaigns')
+                .select('name')
+                .eq('campaign_id', attempt.campaign_id)
+                .maybeSingle();
+            campaignName = camp?.name ?? null;
+        }
+        const leadMeta = (leadData?.metadata || {});
+        const leadName = contactName
+            || (typeof leadMeta.lead_name === 'string' ? leadMeta.lead_name : null)
+            || (typeof leadMeta.name === 'string' ? leadMeta.name : null);
+        const nameParts = leadName ? leadName.split(' ') : [];
+        // Get agent's active session for session_id
+        const { data: agentSession } = await supabase_1.supabase
+            .from('agent_sessions')
+            .select('session_id')
+            .eq('org_id', orgId)
+            .eq('agent_id', userId)
+            .is('ended_at', null)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+        return reply.send({
+            has_wrap_up: true,
+            session_id: agentSession?.session_id ?? null,
+            campaign: {
+                id: attempt.campaign_id,
+                name: campaignName,
+            },
+            lead: {
+                id: attempt.lead_id,
+                first_name: nameParts[0] || null,
+                last_name: nameParts.slice(1).join(' ') || null,
+                phone: attempt.to_number || (typeof leadMeta.phone === 'string' ? leadMeta.phone : null),
+                status: leadData?.status ?? null,
+                latest_note: leadData?.latest_note ?? null,
+                last_agent_disposition: leadData?.last_agent_disposition ?? null,
+                do_not_call: leadData?.do_not_call ?? false,
+                attempt_count: leadData?.attempt_count ?? 0,
+            },
+            call_attempt: {
+                id: attempt.id,
+                call_id: attempt.call_id,
+                system_outcome: attempt.system_outcome,
+                agent_disposition: attempt.agent_disposition,
+                wrap_up_status: attempt.wrap_up_status,
+                started_at: attempt.created_at,
+                answered_at: attempt.answered_at,
+                bridged_at: attempt.bridged_at,
+                ended_at: attempt.ended_at,
+                duration_seconds: attempt.duration_seconds,
+                talk_seconds: attempt.talk_seconds,
+            },
+        });
     });
     // ────────────────────────────────────────────────────────────────────────────
     // SUPERVISOR
