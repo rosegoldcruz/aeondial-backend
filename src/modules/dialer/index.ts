@@ -711,11 +711,20 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
       .eq('campaign_id', campaign_id)
       .in('dial_state', ['pending', 'callback']);
 
+    // Live calls for this campaign (active/bridged)
+    const { data: liveCalls } = await supabase
+      .from('calls')
+      .select('call_id, contact_id, lead_id, assigned_agent, status, started_at')
+      .eq('org_id', orgId)
+      .eq('campaign_id', campaign_id)
+      .in('status', ['DIALING_LEAD', 'ANSWERED', 'AMD_HUMAN', 'BRIDGED', 'dialing', 'originated', 'bridged']);
+
     return reply.send({
       campaign_id,
       queue: { waiting, active, failed, completed },
       agents: { ready: readyCount ?? 0, incall: incallCount ?? 0 },
       leads: { pending: pendingLeads ?? 0 },
+      live_calls_data: liveCalls ?? [],
     });
   });
 
