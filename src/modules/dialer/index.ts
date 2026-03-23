@@ -327,24 +327,26 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
         return reply.status(401).send({ error: 'Missing authenticated user identity (x-user-email)' });
       }
 
+      // EXACT-FIRST resolver:
+      // 1. Exact match already checked above — if we are here, no exact row exists.
+      // 2. Attempt fallback: find any row for this user_id.
+      // 3. If found in a different org, always attempt migration (Clerk JWT proves
+      //    ownership; the active org is authoritative for this session).
+      // 4. Only throw USER_ORG_CONFLICT if the migration DB call itself fails.
       const crossOrgUser = await findUserInOtherOrg(req.user_id, orgId);
       if (crossOrgUser) {
-        if (canReconcileLegacyUser(crossOrgUser as Record<string, unknown>)) {
-          const reconciledUser = await reconcileLegacyUserToActiveOrg({
-            userId: req.user_id,
-            activeOrgId: orgId,
-            activeEmail: bootstrapEmail,
-            activeName: bootstrapName,
-            desiredSoftphone,
-            crossOrgUser: crossOrgUser as Record<string, unknown>,
-          });
+        const reconciledUser = await reconcileLegacyUserToActiveOrg({
+          userId: req.user_id,
+          activeOrgId: orgId,
+          activeEmail: bootstrapEmail,
+          activeName: bootstrapName,
+          desiredSoftphone,
+          crossOrgUser: crossOrgUser as Record<string, unknown>,
+        });
 
-          if (reconciledUser) {
-            user = reconciledUser;
-          }
-        }
-
-        if (!user) {
+        if (reconciledUser) {
+          user = reconciledUser;
+        } else {
           return reply.status(409).send({
             error: 'User exists in a different org and cannot be resolved for the active org',
             code: 'USER_ORG_CONFLICT',
