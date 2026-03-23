@@ -37,6 +37,7 @@ import {
   createAgentSession,
   getAgentSession,
   transitionAgentState,
+  countReadyAgents,
   AgentState,
 } from './agentState';
 
@@ -635,8 +636,41 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
     if (campErr) return reply.status(500).send({ error: campErr.message });
     if (!campaign) return reply.status(404).send({ error: 'Campaign not found' });
 
-    // Start worker and seed queue
-    startDialerWorker(orgId, campaign_id);
+    // ─── PREFLIGHT GATE ────────────────────────────────────────────────
+
+    // 1. Require at least one READY agent session
+    const readyAgents = await countReadyAgents(orgId, campaign_id);
+    if (readyAgents === 0) {
+      return reply.status(409).send({
+        error: 'No READY agent session found. Agent must be logged in and in READY state before starting the dialer.',
+        code: 'NO_READY_AGENT',
+        campaign_id,
+      });
+    }
+
+    // 2. Require at least one dialable lead in queue
+    const { count: dialableLeads, error: queueErr } = await supabase
+      .from('v_dialer_queue')
+      .select('cl_id', { count: 'exact', head: true })
+      .eq('org_id', orgId)
+      .eq('campaign_id', campaign_id);
+
+    if (queueErr) return reply.status(500).send({ error: queueErr.message });
+
+    if (!dialableLeads || dialableLeads === 0) {
+      return reply.status(409).send({
+        error: 'No dialable leads in queue for this campaign. Import leads or reset exhausted leads before starting.',
+        code: 'NO_DIALABLE_LEADS',
+        campaign_id,
+      });
+    }
+
+    // ─── SAFE MODE ────────────────────────────────────────────────────────
+    const query = (req.query ?? {}) as Record<string, unknown>;
+    const safeMode = query.safe_mode === 'true' || query.safe_mode === '1';
+
+    // ─── START ───────────────────────────────────────────────────────────
+    startDialerWorker(orgId, campaign_id, { safeMode });
     const enqueued = await seedDialerQueue(orgId, campaign_id, 100);
 
     // Mark campaign active
@@ -646,9 +680,12 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
       .eq('campaign_id', campaign_id)
       .eq('org_id', orgId);
 
-    logger.info({ org_id: orgId, campaign_id, enqueued }, 'Campaign dialer started');
+    logger.info(
+      { org_id: orgId, campaign_id, enqueued, ready_agents: readyAgents, safe_mode: safeMode },
+      'Campaign dialer started',
+    );
 
-    return reply.send({ success: true, campaign_id, enqueued });
+    return reply.send({ success: true, campaign_id, enqueued, ready_agents: readyAgents, safe_mode: safeMode });
   });
 
   /** POST /dialer/campaigns/:campaign_id/stop */

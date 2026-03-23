@@ -18,7 +18,9 @@ export type WsEventType =
   | 'queue.lead_answered'  // lead answered (post-AMD human)
   | 'queue.lead_abandoned' // lead was abandoned (no agent available)
   | 'ai.whisper'
-  | 'supervisor.control';
+  | 'supervisor.control'
+  | 'campaign.paused'        // campaign was paused (manually or via auto-pause)
+  | 'campaign.infra_blocked';// infrastructure failure blocked a call attempt
 
 export type WsEnvelope = {
   type: WsEventType;

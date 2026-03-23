@@ -28,9 +28,134 @@ import { supabase } from '../../core/supabase';
 import { ARI, AriRequestError } from '../../core/ari';
 import { emitOrgEvent } from '../../core/websocket';
 import { logger } from '../../core/logger';
-import { reserveNextAgent, transitionAgentState } from './agentState';
+import { reserveNextAgent, transitionAgentState, countReadyAgents } from './agentState';
 import { buildDialerCallMetadata, resolveOutboundEndpoint } from './orchestrator';
 import { getDialerCall, transitionDialerCallState } from './callState';
+
+// ── Infra-failure classification ──────────────────────────────────────────────
+// ARI HTTP codes that indicate the SIP trunk / Asterisk / session is unavailable
+// (NOT a real lead outcome). These must NOT increment lead attempt count or mark
+// the lead failed — they are system-side rejections.
+const INFRA_ARI_STATUSES = new Set([0, 400, 500, 502, 503, 504]);
+const INFRA_ARI_MESSAGES = [
+  'connection refused', 'econnrefused', 'enotfound', 'timeout', 'etimedout',
+  'service unavailable', 'bad gateway', 'channel not found', 'unknown endpoint',
+  'no such endpoint', 'cannot create channel', 'request timeout',
+];
+
+function isInfraFailure(err: unknown): boolean {
+  if (err instanceof AriRequestError) {
+    if (INFRA_ARI_STATUSES.has(err.status)) return true;
+    const msg = (err.message || '').toLowerCase();
+    return INFRA_ARI_MESSAGES.some((pat) => msg.includes(pat));
+  }
+  if (err instanceof Error) {
+    const msg = err.message.toLowerCase();
+    return INFRA_ARI_MESSAGES.some((pat) => msg.includes(pat));
+  }
+  return false;
+}
+
+/** Structured audit record written to campaign_leads.metadata.infra_failure_log */
+async function recordInfraFailureAudit(args: {
+  clId: string;
+  orgId: string;
+  campaignId: string;
+  leadId: string;
+  agentId: string;
+  sessionId: string;
+  endpoint: string;
+  rejectionSource: string;
+  rejectionReason: string;
+  callId: string;
+}): Promise<void> {
+  const { clId, orgId, campaignId, leadId, agentId, sessionId, endpoint,
+    rejectionSource, rejectionReason, callId } = args;
+
+  logger.warn(
+    {
+      category: 'INFRA_FAILURE',
+      lead_state_changed: false,
+      org_id: orgId,
+      campaign_id: campaignId,
+      lead_id: leadId,
+      cl_id: clId,
+      call_id: callId,
+      agent_id: agentId,
+      session_id: sessionId,
+      endpoint,
+      rejection_source: rejectionSource,
+      rejection_reason: rejectionReason,
+    },
+    '[INFRA_BLOCK] ARI originate rejected by infrastructure — lead NOT consumed',
+  );
+
+  // Append to metadata.infra_failure_log — does NOT touch attempts or dial_state
+  const { data: row } = await supabase
+    .from('campaign_leads')
+    .select('metadata')
+    .eq('cl_id', clId)
+    .eq('org_id', orgId)
+    .maybeSingle();
+
+  const existing = (row?.metadata ?? {}) as Record<string, unknown>;
+  const log = Array.isArray(existing.infra_failure_log) ? existing.infra_failure_log : [];
+  log.push({
+    at: new Date().toISOString(),
+    call_id: callId,
+    agent_id: agentId,
+    session_id: sessionId,
+    endpoint,
+    rejection_source: rejectionSource,
+    rejection_reason: rejectionReason,
+  });
+
+  const infraFailureCount = typeof existing.infra_failure_count === 'number'
+    ? existing.infra_failure_count + 1
+    : 1;
+
+  await supabase
+    .from('campaign_leads')
+    .update({
+      metadata: {
+        ...existing,
+        infra_failure_log: log,
+        infra_failure_count: infraFailureCount,
+        last_infra_failure_at: new Date().toISOString(),
+      },
+      updated_at: new Date().toISOString(),
+    })
+    .eq('cl_id', clId)
+    .eq('org_id', orgId);
+}
+
+/** Auto-pause a campaign and drain the queue immediately */
+async function pauseCampaignOnInfraFailure(
+  orgId: string,
+  campaignId: string,
+  reason: string,
+): Promise<void> {
+  logger.error(
+    { org_id: orgId, campaign_id: campaignId, reason },
+    '[INFRA_AUTOPAUSE] Pausing campaign due to infrastructure failure',
+  );
+
+  await supabase
+    .from('campaigns')
+    .update({ status: 'paused', updated_at: new Date().toISOString() })
+    .eq('campaign_id', campaignId)
+    .eq('org_id', orgId);
+
+  emitOrgEvent({
+    type: 'campaign.paused',
+    org_id: orgId,
+    campaign_id: campaignId,
+    payload: { reason: 'infra_failure', detail: reason, auto_paused: true },
+  });
+
+  await drainDialerQueue(orgId, campaignId);
+  await stopDialerWorker(orgId, campaignId);
+}
 
 export interface DialerJobData {
   org_id: string;
@@ -163,20 +288,36 @@ export async function drainDialerQueue(orgId: string, campaignId: string): Promi
 
 const activeWorkers = new Map<string, Worker>();
 
-export function startDialerWorker(orgId: string, campaignId: string): void {
+export function startDialerWorker(
+  orgId: string,
+  campaignId: string,
+  opts: { safeMode?: boolean } = {},
+): void {
   const name = queueName(orgId, campaignId);
 
   if (activeWorkers.has(name)) return; // already running
+
+  // safeMode: max 1 concurrent call, 2s cooldown between attempts
+  const concurrency = opts.safeMode ? 1 : 10;
+  const rateLimitMax = opts.safeMode ? 1 : Number(process.env.DIALER_CPS ?? 5);
+  const rateLimitDuration = opts.safeMode ? 2000 : 1000;
+
+  if (opts.safeMode) {
+    logger.warn(
+      { org_id: orgId, campaign_id: campaignId },
+      '[SAFE_MODE] Dialer started in safe/test mode: concurrency=1, cooldown=2s',
+    );
+  }
 
   const worker = new Worker<DialerJobData>(
     name,
     async (job: Job<DialerJobData>) => processDialerJob(job),
     {
       connection: bullConnection,
-      concurrency: 10, // max parallel dials per worker instance
+      concurrency,
       limiter: {
-        max: Number(process.env.DIALER_CPS ?? 5),
-        duration: 1000, // per second
+        max: rateLimitMax,
+        duration: rateLimitDuration,
       },
     },
   );
@@ -381,24 +522,80 @@ async function processDialerJob(job: Job<DialerJobData>): Promise<void> {
       });
     }
   } catch (err) {
-    // ARI originate failed
+    // ── ARI originate failed: classify infra vs real lead failure ───────────
+    const ariStatus = err instanceof AriRequestError ? err.status : 0;
+    const errMsg = err instanceof Error ? err.message : String(err);
     const errPayload =
       err instanceof AriRequestError
         ? { message: err.message, status: err.status, response: err.responseText }
-        : { message: err instanceof Error ? err.message : String(err) };
+        : { message: errMsg };
+
+    const infraFailure = isInfraFailure(err);
+    const rejectionSource = err instanceof AriRequestError ? 'ari' : 'network';
+    const rejectionReason = `${rejectionSource}:${ariStatus || 'error'}:${errMsg.slice(0, 120)}`;
 
     const currentCall = await getDialerCall(call_id, org_id);
+
+    if (infraFailure) {
+      // ── INFRA FAILURE: do NOT mark lead failed, do NOT increment attempts ──
+      await recordInfraFailureAudit({
+        clId: cl_id, orgId: org_id, campaignId: campaign_id, leadId: lead_id,
+        agentId, sessionId, endpoint, rejectionSource, rejectionReason, callId: call_id,
+      });
+
+      // Return lead to pending (no attempt increment)
+      await releaseCampaignLead(cl_id, org_id, 'pending');
+
+      // Mark call as system_blocked (not FAILED)
+      if (currentCall) {
+        await transitionDialerCallState(currentCall, 'FAILED', {
+          eventType: 'lead.infra_blocked',
+          metadataPatch: {
+            ari_error: errPayload,
+            infra_blocked: true,
+            rejection_source: rejectionSource,
+            rejection_reason: rejectionReason,
+          },
+          eventPayload: { ari_error: errPayload, infra_blocked: true },
+        }).catch(() => undefined);
+      }
+
+      await transitionAgentState(sessionId, org_id, 'READY', { reason: 'infra_blocked' });
+
+      emitOrgEvent({
+        type: 'campaign.infra_blocked',
+        org_id,
+        campaign_id,
+        payload: { call_id, cl_id, rejection_source: rejectionSource,
+          rejection_reason: rejectionReason, lead_state_changed: false },
+      });
+
+      // Auto-pause campaign: infra failed, no point burning more leads
+      await pauseCampaignOnInfraFailure(org_id, campaign_id, rejectionReason);
+      return;
+    }
+
+    // ── REAL lead failure (ring no-answer, busy, etc.) ──────────────────────
     if (currentCall) {
       await transitionDialerCallState(currentCall, 'FAILED', {
         eventType: 'lead.originate_failed',
-        metadataPatch: { ari_error: errPayload },
+        metadataPatch: {
+          ari_error: errPayload,
+          infra_blocked: false,
+          rejection_source: rejectionSource,
+          rejection_reason: rejectionReason,
+        },
         eventPayload: { ari_error: errPayload },
       }).catch(() => undefined);
     }
     await releaseCampaignLead(cl_id, org_id, 'failed');
     await transitionAgentState(sessionId, org_id, 'READY', { reason: 'originate_failed' });
 
-    logger.error({ org_id, campaign_id, cl_id, call_id, err: errPayload }, 'ARI originate failed');
+    logger.error(
+      { org_id, campaign_id, cl_id, call_id, err: errPayload,
+        rejection_source: rejectionSource, rejection_reason: rejectionReason },
+      '[LEAD_FAILURE] ARI originate failed (real lead outcome)',
+    );
     return;
   }
 
