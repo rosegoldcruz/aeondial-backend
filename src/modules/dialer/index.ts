@@ -39,6 +39,8 @@ import {
   transitionAgentState,
   countReadyAgents,
   AgentState,
+  verifyAriEndpoint,
+  originateAgentLeg,
 } from './agentState';
 
 import { recordAmdResult, parseAmdResult, amdDispatchAction } from './amd';
@@ -543,6 +545,17 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
     }
     const endpoint = normalizeAgentEndpoint(rawEndpoint);
 
+    // ── SIP Registration Gate ──────────────────────────────────────────────
+    const { registered, state: epState } = await verifyAriEndpoint(endpoint);
+    if (!registered) {
+      return reply.status(409).send({
+        error: 'SIP endpoint is not registered in Asterisk. Register your softphone first.',
+        code: 'ENDPOINT_NOT_REGISTERED',
+        endpoint,
+        ari_state: epState,
+      });
+    }
+
     try {
       const session = await createAgentSession(
         orgId,
@@ -556,12 +569,24 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
             ...(body.softphone || {}),
             endpoint,
           },
-          auto_next: true,
           wrap_until: null,
           active_call_id: null,
         },
       );
-      return reply.status(201).send({ session });
+
+      // ── Originate Agent Leg ────────────────────────────────────────────
+      // Agent's phone will ring; when answered the ARI StasisStart handler
+      // will create the waiting bridge and set registration_verified=true.
+      let agentLegStatus = 'skipped';
+      try {
+        await originateAgentLeg(orgId, session.session_id, body.agent_id, endpoint);
+        agentLegStatus = 'originating';
+      } catch (legErr) {
+        logger.warn({ err: legErr, session_id: session.session_id }, 'Failed to originate agent leg — session still created OFFLINE');
+        agentLegStatus = 'failed';
+      }
+
+      return reply.status(201).send({ session, agent_leg_status: agentLegStatus });
     } catch (err) {
       logger.error({ err, org_id: orgId }, 'Failed to create agent session');
       return reply.status(500).send({ error: 'Failed to create session' });
@@ -579,6 +604,50 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
     if (!session) return reply.status(404).send({ error: 'No active session found' });
 
     return reply.send({ session });
+  });
+
+  /** POST /dialer/agents/:session_id/go-ready – confirm agent leg live, transition OFFLINE → READY */
+  app.post('/agents/:session_id/go-ready', async (req, reply) => {
+    const orgId = requireOrg(req, reply);
+    if (!orgId) return;
+
+    const { session_id } = req.params as { session_id: string };
+
+    const { data: session, error: sessErr } = await supabase
+      .from('agent_sessions')
+      .select('session_id, state, channel_id, registration_verified, agent_id')
+      .eq('session_id', session_id)
+      .eq('org_id', orgId)
+      .is('ended_at', null)
+      .maybeSingle();
+
+    if (sessErr) return reply.status(500).send({ error: sessErr.message });
+    if (!session) return reply.status(404).send({ error: 'Session not found' });
+
+    if (!session.registration_verified || !session.channel_id) {
+      return reply.status(409).send({
+        error: 'Agent leg not yet confirmed. Wait for your phone to connect first.',
+        code: 'AGENT_LEG_NOT_LIVE',
+      });
+    }
+
+    // Verify the agent's channel is still alive in ARI
+    try {
+      await ARI.channels.get(session.channel_id);
+    } catch {
+      return reply.status(409).send({
+        error: 'Agent channel is no longer active. Please re-arm your session.',
+        code: 'AGENT_CHANNEL_DEAD',
+      });
+    }
+
+    try {
+      const updated = await transitionAgentState(session_id, orgId, 'READY', { reason: 'go_ready' });
+      return reply.send({ session: updated });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'State transition failed';
+      return reply.status(409).send({ error: msg });
+    }
   });
 
   /** POST /dialer/agents/:session_id/state – FSM transition */
@@ -665,12 +734,8 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
       });
     }
 
-    // ─── SAFE MODE ────────────────────────────────────────────────────────
-    const query = (req.query ?? {}) as Record<string, unknown>;
-    const safeMode = query.safe_mode === 'true' || query.safe_mode === '1';
-
     // ─── START ───────────────────────────────────────────────────────────
-    startDialerWorker(orgId, campaign_id, { safeMode });
+    startDialerWorker(orgId, campaign_id);
     const enqueued = await seedDialerQueue(orgId, campaign_id, 100);
 
     // Mark campaign active
@@ -681,11 +746,11 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
       .eq('org_id', orgId);
 
     logger.info(
-      { org_id: orgId, campaign_id, enqueued, ready_agents: readyAgents, safe_mode: safeMode },
+      { org_id: orgId, campaign_id, enqueued, ready_agents: readyAgents },
       'Campaign dialer started',
     );
 
-    return reply.send({ success: true, campaign_id, enqueued, ready_agents: readyAgents, safe_mode: safeMode });
+    return reply.send({ success: true, campaign_id, enqueued, ready_agents: readyAgents });
   });
 
   /** POST /dialer/campaigns/:campaign_id/stop */

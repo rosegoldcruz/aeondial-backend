@@ -291,23 +291,21 @@ const activeWorkers = new Map<string, Worker>();
 export function startDialerWorker(
   orgId: string,
   campaignId: string,
-  opts: { safeMode?: boolean } = {},
 ): void {
   const name = queueName(orgId, campaignId);
 
   if (activeWorkers.has(name)) return; // already running
 
-  // safeMode: max 1 concurrent call, 2s cooldown between attempts
-  const concurrency = opts.safeMode ? 1 : 10;
-  const rateLimitMax = opts.safeMode ? 1 : Number(process.env.DIALER_CPS ?? 5);
-  const rateLimitDuration = opts.safeMode ? 2000 : 1000;
+  // Progressive dialing: always 1 concurrent call per worker
+  // One agent, one lead at a time — no parallel dials
+  const concurrency = 1;
+  const rateLimitMax = 1;
+  const rateLimitDuration = 2000;
 
-  if (opts.safeMode) {
-    logger.warn(
-      { org_id: orgId, campaign_id: campaignId },
-      '[SAFE_MODE] Dialer started in safe/test mode: concurrency=1, cooldown=2s',
-    );
-  }
+  logger.info(
+    { org_id: orgId, campaign_id: campaignId },
+    'Dialer worker started: concurrency=1 (progressive agent-first mode)',
+  );
 
   const worker = new Worker<DialerJobData>(
     name,
@@ -479,7 +477,71 @@ async function processDialerJob(job: Job<DialerJobData>): Promise<void> {
     .eq('cl_id', cl_id)
     .eq('org_id', org_id);
 
-  // 3. Originate via ARI
+  // ── 2b. Validate agent has a live SIP channel (agent-first model) ───────────
+  const agentChannelId = session.channel_id;
+  const waitingBridgeId = session.waiting_bridge_id;
+
+  if (!agentChannelId) {
+    logger.warn(
+      { org_id, campaign_id, session_id: sessionId, agent_id: agentId },
+      '[AGENT_FIRST] Agent has no live channel — releasing lead and resetting agent to READY',
+    );
+    await releaseCampaignLead(cl_id, org_id, 'pending');
+    const callToAbandon = await getDialerCall(call_id, org_id);
+    if (callToAbandon) {
+      await transitionDialerCallState(callToAbandon, 'ABANDONED', {
+        eventType: 'queue.lead_abandoned',
+        metadataPatch: { abandon_reason: 'no_agent_channel' },
+        eventPayload: { reason: 'no_agent_channel' },
+      }).catch(() => undefined);
+    }
+    await transitionAgentState(sessionId, org_id, 'READY', { reason: 'no_agent_channel' });
+    return;
+  }
+
+  // ── 2c. Create call bridge and add agent ─────────────────────────────────────
+  const callBridgeId = `call-bridge-${call_id}`;
+  try {
+    await ARI.bridges.create(callBridgeId, 'mixing');
+  } catch (err) {
+    // 409 = already exists (shouldn't happen but tolerate)
+    if (!(err instanceof AriRequestError && err.status === 409)) {
+      throw err;
+    }
+  }
+
+  // Remove agent from waiting bridge
+  if (waitingBridgeId) {
+    await ARI.bridges.removeChannel(waitingBridgeId, [agentChannelId]).catch(() => {});
+  }
+
+  // Add agent to call bridge — agent is now waiting for lead
+  try {
+    await ARI.bridges.addChannel(callBridgeId, [agentChannelId]);
+  } catch (bridgeErr) {
+    // Failed to put agent in bridge — treat as infra failure
+    logger.error({ err: bridgeErr, call_id, agent_channel: agentChannelId, bridge_id: callBridgeId }, 'Failed to add agent to call bridge');
+    await ARI.bridges.destroy(callBridgeId).catch(() => {});
+    // Return agent to waiting bridge
+    if (waitingBridgeId) {
+      await ARI.bridges.addChannel(waitingBridgeId, [agentChannelId]).catch(() => {});
+    }
+    await releaseCampaignLead(cl_id, org_id, 'pending');
+    await transitionAgentState(sessionId, org_id, 'READY', { reason: 'bridge_setup_failed' });
+    return;
+  }
+
+  // ── Store bridge_id in call metadata before originate ─────────────────────
+  await transitionDialerCallState(dialingCallState, 'DIALING_LEAD', {
+    allowSameState: true,
+    eventType: 'call.bridge_created',
+    metadataPatch: {
+      call_bridge_id: callBridgeId,
+      agent_channel_id: agentChannelId,
+    },
+  });
+
+  // 3. Originate lead — no AMD; lead goes directly to Stasis
   let ariChannelId: string;
 
   try {
@@ -488,16 +550,17 @@ async function processDialerJob(job: Job<DialerJobData>): Promise<void> {
       endpoint,
       callerId: callerIdNumber,
       channelId: call_id,
-      appArgs: `dialer,${call_id},${org_id}`,
+      appArgs: `lead-leg,${call_id},${org_id},${callBridgeId}`,
       timeout: 30,
       variables: {
         DIALER_CALL_ID: call_id,
         DIALER_ORG_ID: org_id,
         DIALER_CAMPAIGN_ID: campaign_id,
         DIALER_CL_ID: cl_id,
+        DIALER_BRIDGE_ID: callBridgeId,
         DIALER_BACKEND_URL: process.env.BACKEND_INTERNAL_URL ?? 'http://localhost:4000',
-        AMD_ENABLED: '1',
         DIALER_CHANNEL_ROLE: 'lead',
+        // AMD_ENABLED intentionally absent — agent-first progressive mode
       },
     }) as { id: string } | undefined;
 
@@ -522,7 +585,14 @@ async function processDialerJob(job: Job<DialerJobData>): Promise<void> {
       });
     }
   } catch (err) {
-    // ── ARI originate failed: classify infra vs real lead failure ───────────
+    // ── ARI originate failed: clean up bridge and classify error ────────────
+    // Bridge was created before originate — must destroy on failure to not orphan
+    await ARI.bridges.destroy(callBridgeId).catch(() => {});
+    // Return agent to their waiting bridge
+    if (waitingBridgeId) {
+      await ARI.bridges.addChannel(waitingBridgeId, [agentChannelId]).catch(() => {});
+    }
+
     const ariStatus = err instanceof AriRequestError ? err.status : 0;
     const errMsg = err instanceof Error ? err.message : String(err);
     const errPayload =
@@ -599,12 +669,13 @@ async function processDialerJob(job: Job<DialerJobData>): Promise<void> {
     return;
   }
 
-  // 4. The lead channel now waits in Stasis. The ARI event loop will continue the
-  //    answered lead into dialplan AMD, then drive beep/bridge/wrap from there.
-  //    This job completes here; further call handling is event-driven.
+  // 4. Lead channel is now in Stasis. On StasisStart, ariEvents routes to
+  //    handleLeadChannelAnswered() which adds the lead to callBridgeId.
+  //    Agent is already in the bridge. Both parties talk with no AMD delay.
   logger.info(
-    { org_id, campaign_id, cl_id, call_id, ari_channel_id: ariChannelId, agent_id: agentId },
-    'Dialer job: call originated, awaiting AMD',
+    { org_id, campaign_id, cl_id, call_id, ari_channel_id: ariChannelId,
+      agent_id: agentId, call_bridge_id: callBridgeId },
+    'Dialer job: call originated, awaiting lead answer',
   );
 }
 

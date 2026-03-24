@@ -78,6 +78,8 @@ const websocketPlugin = async (app) => {
                     return;
                 }
                 case 'agent.state':
+                case 'agent.leg_live':
+                case 'agent.leg_dropped':
                 case 'call.event':
                 case 'call.amd_result':
                 case 'call.human_ready':
@@ -88,7 +90,12 @@ const websocketPlugin = async (app) => {
                 case 'queue.lead_answered':
                 case 'queue.lead_abandoned':
                 case 'ai.whisper':
-                case 'supervisor.control': {
+                case 'supervisor.control':
+                case 'campaign.paused':
+                case 'campaign.infra_blocked':
+                case 'wrap_up.started':
+                case 'wrap_up.expiring':
+                case 'wrap_up.expired': {
                     emitToOrg(org_id, {
                         type: event.type,
                         org_id,

@@ -2,11 +2,11 @@ import { config } from './config';
 import { logger } from './logger';
 import WebSocket from 'ws';
 import {
-  finalizeBridgeAfterBeep,
   findCallByBridgeId,
   findCallByChannelId,
   findCallByPlaybackId,
-  handleAgentAlertAnswered,
+  handleAgentLegAnswered,
+  handleAgentLegHangup,
   handleCallChannelHangup,
   handleLeadChannelAnswered,
 } from '../modules/dialer/orchestrator';
@@ -105,9 +105,41 @@ async function handleAriEvent(event: AriEvent): Promise<void> {
   switch (event.type) {
     case 'StasisStart': {
       await recordChannelEvent(event, 'ari.stasis_start');
-      if (event.channel?.state === 'Up' && event.channel.id) {
-        await handleLeadChannelAnswered(event.channel.id).catch(() => undefined);
-        await handleAgentAlertAnswered(event.channel.id).catch(() => undefined);
+
+      const channelId = event.channel?.id;
+      if (!channelId) return;
+
+      // Determine channel role from appArgs
+      const args = event.args || [];
+      const role = typeof args[0] === 'string' ? args[0] : '';
+
+      if (role === 'agent-leg') {
+        // Agent answered their SIP phone — args: [agent-leg, session_id, org_id]
+        const sessionId = typeof args[1] === 'string' ? args[1] : '';
+        const orgId = typeof args[2] === 'string' ? args[2] : '';
+        if (sessionId && orgId) {
+          await handleAgentLegAnswered(channelId, sessionId, orgId).catch((err) => {
+            logger.error({ err, channel_id: channelId, session_id: sessionId }, 'Failed handling agent-leg StasisStart');
+          });
+        } else {
+          logger.warn({ channel_id: channelId, args }, 'agent-leg StasisStart missing session_id/org_id in appArgs');
+        }
+        return;
+      }
+
+      if (role === 'lead-leg' || role === 'dialer') {
+        // Lead answered — args: [lead-leg, call_id, org_id, bridge_id]
+        if (event.channel?.state === 'Up') {
+          await handleLeadChannelAnswered(channelId).catch((err) => {
+            logger.error({ err, channel_id: channelId }, 'Failed handling lead-leg StasisStart');
+          });
+        }
+        return;
+      }
+
+      // Unknown role — attempt both handlers (graceful fallback for unlabeled channels)
+      if (event.channel?.state === 'Up') {
+        await handleLeadChannelAnswered(channelId).catch(() => undefined);
       }
       return;
     }
@@ -127,11 +159,8 @@ async function handleAriEvent(event: AriEvent): Promise<void> {
 
     case 'PlaybackFinished': {
       await recordPlaybackEvent(event, 'ari.playback_finished');
-      if (event.playback?.id) {
-        await finalizeBridgeAfterBeep(event.playback.id).catch((error) => {
-          logger.error({ error, playback_id: event.playback?.id }, 'Failed finalizing bridge after beep');
-        });
-      }
+      // Note: PlaybackFinished/beep bridge finalization removed in agent-first model
+      // AMD alert beep is no longer used in progressive mode
       return;
     }
 
@@ -139,8 +168,14 @@ async function handleAriEvent(event: AriEvent): Promise<void> {
     case 'ChannelDestroyed': {
       await recordChannelEvent(event, `ari.${event.type === 'ChannelDestroyed' ? 'channel_destroyed' : 'hangup_request'}`);
       if (event.channel?.id) {
-        await handleCallChannelHangup(event.channel.id, event.cause_txt || event.type || 'hangup').catch((error) => {
-          logger.error({ error, channel_id: event.channel?.id }, 'Failed handling channel hangup');
+        const channelId = event.channel.id;
+        // Check for agent-leg hangup FIRST — if it's the agent's persistent SIP channel
+        await handleAgentLegHangup(channelId).catch((err) => {
+          logger.error({ err, channel_id: channelId }, 'Failed handling agent-leg hangup');
+        });
+        // Also handle call-side hangup (hangup is idempotent if channel not in a call)
+        await handleCallChannelHangup(channelId, event.cause_txt || event.type || 'hangup').catch((err) => {
+          logger.error({ err, channel_id: channelId }, 'Failed handling call channel hangup');
         });
       }
       return;

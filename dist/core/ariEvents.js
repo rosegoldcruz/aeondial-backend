@@ -75,9 +75,38 @@ async function handleAriEvent(event) {
     switch (event.type) {
         case 'StasisStart': {
             await recordChannelEvent(event, 'ari.stasis_start');
-            if (event.channel?.state === 'Up' && event.channel.id) {
-                await (0, orchestrator_1.handleLeadChannelAnswered)(event.channel.id).catch(() => undefined);
-                await (0, orchestrator_1.handleAgentAlertAnswered)(event.channel.id).catch(() => undefined);
+            const channelId = event.channel?.id;
+            if (!channelId)
+                return;
+            // Determine channel role from appArgs
+            const args = event.args || [];
+            const role = typeof args[0] === 'string' ? args[0] : '';
+            if (role === 'agent-leg') {
+                // Agent answered their SIP phone — args: [agent-leg, session_id, org_id]
+                const sessionId = typeof args[1] === 'string' ? args[1] : '';
+                const orgId = typeof args[2] === 'string' ? args[2] : '';
+                if (sessionId && orgId) {
+                    await (0, orchestrator_1.handleAgentLegAnswered)(channelId, sessionId, orgId).catch((err) => {
+                        logger_1.logger.error({ err, channel_id: channelId, session_id: sessionId }, 'Failed handling agent-leg StasisStart');
+                    });
+                }
+                else {
+                    logger_1.logger.warn({ channel_id: channelId, args }, 'agent-leg StasisStart missing session_id/org_id in appArgs');
+                }
+                return;
+            }
+            if (role === 'lead-leg' || role === 'dialer') {
+                // Lead answered — args: [lead-leg, call_id, org_id, bridge_id]
+                if (event.channel?.state === 'Up') {
+                    await (0, orchestrator_1.handleLeadChannelAnswered)(channelId).catch((err) => {
+                        logger_1.logger.error({ err, channel_id: channelId }, 'Failed handling lead-leg StasisStart');
+                    });
+                }
+                return;
+            }
+            // Unknown role — attempt both handlers (graceful fallback for unlabeled channels)
+            if (event.channel?.state === 'Up') {
+                await (0, orchestrator_1.handleLeadChannelAnswered)(channelId).catch(() => undefined);
             }
             return;
         }
@@ -93,19 +122,22 @@ async function handleAriEvent(event) {
             return;
         case 'PlaybackFinished': {
             await recordPlaybackEvent(event, 'ari.playback_finished');
-            if (event.playback?.id) {
-                await (0, orchestrator_1.finalizeBridgeAfterBeep)(event.playback.id).catch((error) => {
-                    logger_1.logger.error({ error, playback_id: event.playback?.id }, 'Failed finalizing bridge after beep');
-                });
-            }
+            // Note: PlaybackFinished/beep bridge finalization removed in agent-first model
+            // AMD alert beep is no longer used in progressive mode
             return;
         }
         case 'ChannelHangupRequest':
         case 'ChannelDestroyed': {
             await recordChannelEvent(event, `ari.${event.type === 'ChannelDestroyed' ? 'channel_destroyed' : 'hangup_request'}`);
             if (event.channel?.id) {
-                await (0, orchestrator_1.handleCallChannelHangup)(event.channel.id, event.cause_txt || event.type || 'hangup').catch((error) => {
-                    logger_1.logger.error({ error, channel_id: event.channel?.id }, 'Failed handling channel hangup');
+                const channelId = event.channel.id;
+                // Check for agent-leg hangup FIRST — if it's the agent's persistent SIP channel
+                await (0, orchestrator_1.handleAgentLegHangup)(channelId).catch((err) => {
+                    logger_1.logger.error({ err, channel_id: channelId }, 'Failed handling agent-leg hangup');
+                });
+                // Also handle call-side hangup (hangup is idempotent if channel not in a call)
+                await (0, orchestrator_1.handleCallChannelHangup)(channelId, event.cause_txt || event.type || 'hangup').catch((err) => {
+                    logger_1.logger.error({ err, channel_id: channelId }, 'Failed handling call channel hangup');
                 });
             }
             return;

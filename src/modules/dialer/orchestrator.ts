@@ -3,7 +3,7 @@ import { ARI, AriRequestError } from '../../core/ari';
 import { config } from '../../core/config';
 import { emitOrgEvent } from '../../core/websocket';
 import { logger } from '../../core/logger';
-import { transitionAgentState } from './agentState';
+import { transitionAgentState, markAgentLegAnswered, clearAgentLeg, setAgentWaitingBridge, getAgentSessionByChannelId } from './agentState';
 import {
   ACTIVE_PROGRESSIVE_CALL_STATES,
   DialerCallRow,
@@ -314,11 +314,19 @@ async function scheduleWrapTimer(call: DialerCallRow): Promise<void> {
 
   clearWrapTimer(sessionId);
 
+  // Return agent to waiting bridge before starting wrap countdown
+  const callBridgeId = stringValue(metadata.call_bridge_id) || stringValue(metadata.ari_bridge_id);
+  if (callBridgeId) {
+    await returnAgentToWaitingBridge(sessionId, call.org_id, callBridgeId).catch((err) => {
+      logger.warn({ err, session_id: sessionId, bridge_id: callBridgeId }, 'Could not return agent to waiting bridge during wrap');
+    });
+  }
+
   const wrapSeconds = config.dialerWrapSeconds;
   const wrapUntil = new Date(Date.now() + wrapSeconds * 1000).toISOString();
+  // NOTE: auto_next intentionally NOT set — disposition required for next READY transition
   await patchAgentSessionMetadata(sessionId, call.org_id, {
     wrap_until: wrapUntil,
-    auto_next: true,
     active_call_id: null,
   });
 
@@ -327,7 +335,19 @@ async function scheduleWrapTimer(call: DialerCallRow): Promise<void> {
     agent_id: call.assigned_agent,
     wrap_seconds: wrapSeconds,
     wrap_until: wrapUntil,
-    auto_next: true,
+  });
+
+  emitOrgEvent({
+    type: 'wrap_up.started',
+    org_id: call.org_id,
+    campaign_id: call.campaign_id ?? undefined,
+    payload: {
+      call_id: call.call_id,
+      session_id: sessionId,
+      agent_id: call.assigned_agent,
+      wrap_seconds: wrapSeconds,
+      wrap_until: wrapUntil,
+    },
   });
 
   wrapTimers.set(
@@ -340,6 +360,12 @@ async function scheduleWrapTimer(call: DialerCallRow): Promise<void> {
         await patchAgentSessionMetadata(sessionId, call.org_id, {
           wrap_until: null,
           active_call_id: null,
+        });
+        emitOrgEvent({
+          type: 'wrap_up.expired',
+          org_id: call.org_id,
+          campaign_id: call.campaign_id ?? undefined,
+          payload: { call_id: call.call_id, session_id: sessionId },
         });
       } catch (error) {
         logger.warn({ error, session_id: sessionId, call_id: call.call_id }, 'Wrap timer transition skipped');
@@ -355,11 +381,18 @@ export async function handleLeadChannelAnswered(channelId: string): Promise<void
   if (!call) return;
 
   const metadata = callMetadata(call);
-  if (stringValue(metadata.lead_channel_id) !== channelId && call.call_id !== channelId) {
-    return;
-  }
 
-  if (metadata.amd_started_at) {
+  // Prevent double-processing if lead channel already bridged
+  if (metadata.bridge_joined_at) return;
+  if (stringValue(metadata.lead_channel_id) !== channelId && call.call_id !== channelId) return;
+
+  // Locate the call bridge pre-created by the engine
+  const callBridgeId = stringValue(metadata.call_bridge_id) || stringValue(metadata.ari_bridge_id);
+  if (!callBridgeId) {
+    logger.warn(
+      { call_id: call.call_id, channel_id: channelId },
+      'handleLeadChannelAnswered: no call_bridge_id in metadata — cannot bridge',
+    );
     return;
   }
 
@@ -367,21 +400,99 @@ export async function handleLeadChannelAnswered(channelId: string): Promise<void
     eventType: 'lead.answered',
     metadataPatch: {
       lead_channel_id: channelId,
-      amd_started_at: new Date().toISOString(),
+      answered_at: new Date().toISOString(),
     },
   });
 
-  await updateCallAttempt(call, { answered_at: new Date().toISOString(), system_outcome: 'answered' });
+  await updateCallAttempt(call, {
+    answered_at: new Date().toISOString(),
+    system_outcome: 'answered',
+    lead_channel_id: channelId,
+  });
 
+  // Add lead to the call bridge — agent is already in it from engine.ts
   try {
-    await ARI.channels.continueInDialplan(channelId, 'dialer-amd', 's', 1);
+    await ARI.bridges.addChannel(callBridgeId, [channelId]);
   } catch (error) {
-    logger.error({ error, channel_id: channelId, call_id: call.call_id }, 'Failed to continue answered lead into dialplan');
+    logger.error(
+      { error, channel_id: channelId, bridge_id: callBridgeId, call_id: call.call_id },
+      'handleLeadChannelAnswered: failed to add lead to call bridge',
+    );
     await transitionDialerCallState(answered, 'FAILED', {
-      eventType: 'lead.answer_continue_failed',
-      eventPayload: { channel_id: channelId },
+      eventType: 'lead.bridge_failed',
+      eventPayload: { channel_id: channelId, bridge_id: callBridgeId },
     }).catch(() => undefined);
+    const sessionId = stringValue(metadata.session_id);
+    if (sessionId) {
+      await transitionAgentState(sessionId, call.org_id, 'READY', { reason: 'bridge_failed' }).catch(() => undefined);
+    }
+    await hangupChannel(channelId);
+    await updateCampaignLeadState(call.cl_id, call.org_id, 'failed');
+    return;
   }
+
+  const sessionId = stringValue(metadata.session_id);
+  const agentChannelId = stringValue(metadata.agent_channel_id);
+
+  if (sessionId) {
+    await transitionAgentState(sessionId, call.org_id, 'INCALL', { reason: 'call_bridged' }).catch(() => undefined);
+    await patchAgentSessionMetadata(sessionId, call.org_id, {
+      active_call_id: call.call_id,
+      wrap_until: null,
+    });
+  }
+
+  const bridged = await transitionDialerCallState(answered, 'BRIDGED', {
+    eventType: 'call.bridged',
+    metadataPatch: {
+      bridge_joined_at: new Date().toISOString(),
+      ari_bridge_id: callBridgeId,
+      bridge_ready_at: new Date().toISOString(),
+      lead_channel_id: channelId,
+    },
+    extraUpdates: { assigned_agent: call.assigned_agent },
+    eventPayload: {
+      bridge_id: callBridgeId,
+      agent_channel_id: agentChannelId,
+      lead_channel_id: channelId,
+    },
+  });
+
+  await updateCallAttempt(bridged, {
+    bridged_at: new Date().toISOString(),
+    system_outcome: 'bridged',
+    bridge_id: callBridgeId,
+    lead_channel_id: channelId,
+    agent_channel_id: agentChannelId ?? undefined,
+  });
+
+  await updateCampaignLeadState(bridged.cl_id, bridged.org_id, 'answered');
+
+  const leadSnapshot = await hydrateLeadSnapshot(bridged);
+  emitCallBridged(bridged, {
+    agent_id: bridged.assigned_agent,
+    session_id: sessionId,
+    bridge_id: callBridgeId,
+    lead_id: bridged.lead_id,
+    contact_id: bridged.contact_id,
+    status: bridged.status,
+    started_at: bridged.started_at,
+    lead_name: leadSnapshot.lead_name || metadata.lead_name || leadSnapshot.contact_name || metadata.contact_name || null,
+    contact_name: leadSnapshot.contact_name || metadata.contact_name || null,
+    phone: leadSnapshot.phone || metadata.phone || null,
+    metadata: { ...metadata, ...leadSnapshot, ari_bridge_id: callBridgeId },
+  });
+
+  emitOrgEvent({
+    type: 'queue.lead_answered',
+    org_id: bridged.org_id,
+    campaign_id: bridged.campaign_id ?? undefined,
+    payload: {
+      call_id: bridged.call_id,
+      cl_id: bridged.cl_id,
+      agent_id: bridged.assigned_agent,
+    },
+  });
 }
 
 async function hangupChannel(channelId: string | null): Promise<void> {
@@ -392,6 +503,123 @@ async function hangupChannel(channelId: string | null): Promise<void> {
     // Channel may already be gone.
   }
 }
+
+// ─── Agent-first bridge helpers ───────────────────────────────────────────────
+
+/**
+ * Move the agent's SIP channel from the call bridge back to the waiting bridge.
+ * Destroys the call bridge once the agent has been removed.
+ */
+async function returnAgentToWaitingBridge(
+  sessionId: string,
+  orgId: string,
+  callBridgeId: string,
+): Promise<void> {
+  const { data: session } = await supabase
+    .from('agent_sessions')
+    .select('channel_id, waiting_bridge_id')
+    .eq('session_id', sessionId)
+    .eq('org_id', orgId)
+    .is('ended_at', null)
+    .maybeSingle();
+
+  if (!session?.channel_id) return;
+
+  const { channel_id, waiting_bridge_id } = session as { channel_id: string; waiting_bridge_id: string | null };
+
+  // Remove from call bridge
+  await ARI.bridges.removeChannel(callBridgeId, [channel_id]).catch(() => {});
+  // Destroy the call bridge
+  await ARI.bridges.destroy(callBridgeId).catch(() => {});
+
+  // Put agent into their persistent waiting bridge
+  if (waiting_bridge_id) {
+    await ARI.bridges.addChannel(waiting_bridge_id, [channel_id]).catch((err) => {
+      logger.warn({ err, session_id: sessionId, waiting_bridge_id }, 'Could not add agent back to waiting bridge');
+    });
+  }
+}
+
+/**
+ * Handle agent-leg StasisStart: agent answered their SIP phone.
+ * Creates the waiting bridge, puts agent in it, and marks registration verified.
+ */
+export async function handleAgentLegAnswered(
+  channelId: string,
+  sessionId: string,
+  orgId: string,
+): Promise<void> {
+  // Mark the leg as answered in the session row
+  await markAgentLegAnswered(sessionId, orgId, channelId);
+
+  // Create (or re-use) a waiting bridge for this agent
+  const waitingBridgeId = `waiting-${sessionId}`;
+  try {
+    await ARI.bridges.create(waitingBridgeId, 'mixing');
+  } catch (err) {
+    // 409 = bridge already exists — that's fine
+    if (!(err instanceof AriRequestError && err.status === 409)) {
+      logger.warn({ err, session_id: sessionId }, 'handleAgentLegAnswered: bridge create error (non-fatal)');
+    }
+  }
+
+  // Add agent to waiting bridge
+  try {
+    await ARI.bridges.addChannel(waitingBridgeId, [channelId]);
+  } catch (err) {
+    logger.error({ err, session_id: sessionId, channel_id: channelId }, 'handleAgentLegAnswered: failed to add agent to waiting bridge');
+  }
+
+  // Persist the bridge ID on the session
+  await setAgentWaitingBridge(sessionId, orgId, waitingBridgeId);
+
+  emitOrgEvent({
+    type: 'agent.leg_live',
+    org_id: orgId,
+    payload: {
+      session_id: sessionId,
+      channel_id: channelId,
+      waiting_bridge_id: waitingBridgeId,
+    },
+  });
+
+  logger.info(
+    { session_id: sessionId, channel_id: channelId, waiting_bridge_id: waitingBridgeId },
+    'Agent leg answered — agent in waiting bridge',
+  );
+}
+
+/**
+ * Handle agent-leg ChannelHangupRequest/ChannelDestroyed.
+ * Agent dropped their SIP line — clear session, go OFFLINE.
+ */
+export async function handleAgentLegHangup(channelId: string): Promise<void> {
+  const session = await getAgentSessionByChannelId(channelId);
+  if (!session) return;
+
+  const { session_id, org_id, waiting_bridge_id } = session;
+
+  // Destroy the waiting bridge
+  if (waiting_bridge_id) {
+    await ARI.bridges.destroy(waiting_bridge_id).catch(() => {});
+  }
+
+  // Clear leg tracking on the session
+  await clearAgentLeg(session_id, org_id);
+
+  // Transition to OFFLINE
+  await transitionAgentState(session_id, org_id, 'OFFLINE', { reason: 'agent_leg_hangup' }).catch(() => {});
+
+  emitOrgEvent({
+    type: 'agent.leg_dropped',
+    org_id,
+    payload: { session_id, channel_id: channelId },
+  });
+
+  logger.info({ session_id, channel_id: channelId }, 'Agent leg dropped → OFFLINE');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function originateAgentAlert(call: DialerCallRow, endpoint: string): Promise<DialerCallRow> {
   const metadata = callMetadata(call);
@@ -693,6 +921,7 @@ export async function handleCallChannelHangup(channelId: string, reason: string)
   const leadChannelId = stringValue(metadata.lead_channel_id) || call.call_id;
   const agentChannelId = stringValue(metadata.agent_channel_id);
   const sessionId = stringValue(metadata.session_id);
+  const callBridgeId = stringValue(metadata.call_bridge_id) || stringValue(metadata.ari_bridge_id);
   const isAgentSide = agentChannelId === channelId;
   const isLeadSide = leadChannelId === channelId;
 
@@ -702,16 +931,39 @@ export async function handleCallChannelHangup(channelId: string, reason: string)
     const durationSeconds = call.started_at ? Math.round((now.getTime() - new Date(call.started_at).getTime()) / 1000) : null;
     const bridgeReadyAt = stringValue(metadata.bridge_ready_at);
     const talkSeconds = bridgeReadyAt ? Math.round((now.getTime() - new Date(bridgeReadyAt).getTime()) / 1000) : null;
+
     await updateCallAttempt(call, {
       ended_at: now.toISOString(),
       system_outcome: 'completed',
       duration_seconds: durationSeconds,
       talk_seconds: talkSeconds,
     });
-    if (isAgentSide) {
+
+    if (isLeadSide) {
+      // Lead hung up — agent stays alive; return to waiting bridge
+      if (callBridgeId && agentChannelId) {
+        await ARI.bridges.removeChannel(callBridgeId, [agentChannelId]).catch(() => {});
+        await ARI.bridges.destroy(callBridgeId).catch(() => {});
+        // Restore agent to waiting bridge
+        const { data: agentSession } = await supabase
+          .from('agent_sessions')
+          .select('waiting_bridge_id')
+          .eq('session_id', sessionId ?? '')
+          .is('ended_at', null)
+          .maybeSingle();
+        const waitingBridgeId = (agentSession as { waiting_bridge_id?: string | null } | null)?.waiting_bridge_id;
+        if (waitingBridgeId && agentChannelId) {
+          await ARI.bridges.addChannel(waitingBridgeId, [agentChannelId]).catch(() => {});
+        }
+      }
+    } else if (isAgentSide) {
+      // Agent dropped their SIP mid-call — hang up the lead, clear session via handleAgentLegHangup
       await hangupChannel(leadChannelId);
-    } else if (isLeadSide) {
-      await hangupChannel(agentChannelId);
+      if (callBridgeId) {
+        await ARI.bridges.destroy(callBridgeId).catch(() => {});
+      }
+      // handleAgentLegHangup will fire from ariEvents and take session to OFFLINE
+      // Just schedule wrap and let the WS tell CRM to disposition
     }
 
     if (sessionId) {
@@ -732,7 +984,12 @@ export async function handleCallChannelHangup(channelId: string, reason: string)
 
     if (isAgentSide) {
       await hangupChannel(leadChannelId);
+    } else if (isLeadSide && callBridgeId && agentChannelId) {
+      // Lead dropped before bridge completed — return agent to waiting bridge
+      await ARI.bridges.removeChannel(callBridgeId, [agentChannelId]).catch(() => {});
+      await ARI.bridges.destroy(callBridgeId).catch(() => {});
     }
+
     await updateCampaignLeadState(call.cl_id, call.org_id, 'failed');
     await releaseAgentReady(call, 'call_failed_before_bridge');
   }
@@ -769,6 +1026,8 @@ export function buildDialerCallMetadata(input: {
   phone: string;
   lead_name?: string | null;
   contact_name?: string | null;
+  call_bridge_id?: string | null;
+  agent_channel_id?: string | null;
 }): Record<string, unknown> {
   return {
     session_id: input.session_id,
@@ -777,13 +1036,12 @@ export function buildDialerCallMetadata(input: {
     attempt: input.attempt,
     cl_id: input.cl_id,
     phone: input.phone,
+    call_bridge_id: input.call_bridge_id ?? null,
     lead_channel_id: null,
-    agent_channel_id: null,
+    agent_channel_id: input.agent_channel_id ?? null,
     ari_bridge_id: null,
-    agent_beep_playback_id: null,
     lead_name: input.lead_name ?? null,
     contact_name: input.contact_name ?? null,
-    auto_next: true,
   };
 }
 

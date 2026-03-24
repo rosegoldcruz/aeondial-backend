@@ -20,7 +20,12 @@ export type WsEventType =
   | 'ai.whisper'
   | 'supervisor.control'
   | 'campaign.paused'        // campaign was paused (manually or via auto-pause)
-  | 'campaign.infra_blocked';// infrastructure failure blocked a call attempt
+  | 'campaign.infra_blocked'  // infrastructure failure blocked a call attempt
+  | 'agent.leg_live'          // agent SIP leg answered and waiting bridge ready
+  | 'agent.leg_dropped'       // agent SIP leg disconnected (session → OFFLINE)
+  | 'wrap_up.started'         // wrap-up timer started after call ends
+  | 'wrap_up.expiring'        // wrap-up timer < 10s remaining
+  | 'wrap_up.expired';        // wrap-up timer expired
 
 export type WsEnvelope = {
   type: WsEventType;
@@ -119,6 +124,8 @@ export const websocketPlugin: FastifyPluginAsync = async (app) => {
         }
 
         case 'agent.state':
+        case 'agent.leg_live':
+        case 'agent.leg_dropped':
         case 'call.event':
         case 'call.amd_result':
         case 'call.human_ready':
@@ -129,7 +136,12 @@ export const websocketPlugin: FastifyPluginAsync = async (app) => {
         case 'queue.lead_answered':
         case 'queue.lead_abandoned':
         case 'ai.whisper':
-        case 'supervisor.control': {
+        case 'supervisor.control':
+        case 'campaign.paused':
+        case 'campaign.infra_blocked':
+        case 'wrap_up.started':
+        case 'wrap_up.expiring':
+        case 'wrap_up.expired': {
           emitToOrg(org_id, {
             type: event.type,
             org_id,
