@@ -30,3 +30,6 @@ coverage/
 *.tsbuildinfo
 
 /generated/prisma
+
+# Editor
+.vscode/
