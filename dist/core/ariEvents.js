@@ -126,18 +126,32 @@ async function handleAriEvent(event) {
             // AMD alert beep is no longer used in progressive mode
             return;
         }
-        case 'ChannelHangupRequest':
-        case 'ChannelDestroyed': {
-            await recordChannelEvent(event, `ari.${event.type === 'ChannelDestroyed' ? 'channel_destroyed' : 'hangup_request'}`);
+        case 'ChannelHangupRequest': {
+            await recordChannelEvent(event, 'ari.hangup_request');
             if (event.channel?.id) {
                 const channelId = event.channel.id;
-                // Check for agent-leg hangup FIRST — if it's the agent's persistent SIP channel
-                await (0, orchestrator_1.handleAgentLegHangup)(channelId).catch((err) => {
-                    logger_1.logger.error({ err, channel_id: channelId }, 'Failed handling agent-leg hangup');
+                // Call-side hangup fires on HangupRequest to start wrap-up promptly.
+                // Agent-leg cleanup is intentionally deferred to ChannelDestroyed — the
+                // agent SIP channel is still physically alive when a HangupRequest fires
+                // (BYE is in-flight). Clearing DB state here causes the UI to spin even
+                // though the call is still connected.
+                await (0, orchestrator_1.handleCallChannelHangup)(channelId, event.cause_txt || 'hangup_request').catch((err) => {
+                    logger_1.logger.error({ err, channel_id: channelId }, 'Failed handling call channel hangup (HangupRequest)');
                 });
-                // Also handle call-side hangup (hangup is idempotent if channel not in a call)
-                await (0, orchestrator_1.handleCallChannelHangup)(channelId, event.cause_txt || event.type || 'hangup').catch((err) => {
-                    logger_1.logger.error({ err, channel_id: channelId }, 'Failed handling call channel hangup');
+            }
+            return;
+        }
+        case 'ChannelDestroyed': {
+            await recordChannelEvent(event, 'ari.channel_destroyed');
+            if (event.channel?.id) {
+                const channelId = event.channel.id;
+                // Agent-leg cleanup: channel is definitively gone.
+                await (0, orchestrator_1.handleAgentLegHangup)(channelId).catch((err) => {
+                    logger_1.logger.error({ err, channel_id: channelId }, 'Failed handling agent-leg hangup (ChannelDestroyed)');
+                });
+                // Call-side cleanup: idempotent if already handled on HangupRequest.
+                await (0, orchestrator_1.handleCallChannelHangup)(channelId, event.cause_txt || 'channel_destroyed').catch((err) => {
+                    logger_1.logger.error({ err, channel_id: channelId }, 'Failed handling call channel hangup (ChannelDestroyed)');
                 });
             }
             return;
