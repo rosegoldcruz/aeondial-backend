@@ -160,6 +160,29 @@ export async function createAgentSession(
   const sessionId = crypto.randomUUID();
   const now = new Date().toISOString();
 
+  // Hang up any live ARI channels from previous sessions before ending them in DB.
+  // Without this, old channels linger in Asterisk and can fire spurious hangup events
+  // against the new session (channel_id drift), or pile up as zombie bridges.
+  const { data: openSessions } = await supabase
+    .from('agent_sessions')
+    .select('session_id, channel_id, waiting_bridge_id')
+    .eq('org_id', orgId)
+    .eq('agent_id', agentId)
+    .is('ended_at', null);
+
+  if (openSessions?.length) {
+    await Promise.allSettled(
+      openSessions.map(async (s) => {
+        if (s.waiting_bridge_id) {
+          await ARI.bridges.destroy(s.waiting_bridge_id).catch(() => {});
+        }
+        if (s.channel_id) {
+          await ARI.channels.hangup(s.channel_id).catch(() => {});
+        }
+      }),
+    );
+  }
+
   // Terminate any existing open session for this agent in this org
   await supabase
     .from('agent_sessions')
