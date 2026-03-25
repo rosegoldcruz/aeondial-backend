@@ -586,6 +586,11 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
         agentLegStatus = 'failed';
       }
 
+      logger.info({
+        org_id: orgId, user_id: req.user_id, agent_id: body.agent_id,
+        session_id: session.session_id, campaign_id: body.campaign_id ?? null,
+        endpoint, agent_leg_status: agentLegStatus, session_state: session.state,
+      }, '[DEBUG] session created');
       return reply.status(201).send({ session, agent_leg_status: agentLegStatus });
     } catch (err) {
       logger.error({ err, org_id: orgId }, 'Failed to create agent session');
@@ -624,7 +629,14 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
     if (sessErr) return reply.status(500).send({ error: sessErr.message });
     if (!session) return reply.status(404).send({ error: 'Session not found' });
 
+    logger.info({
+      org_id: orgId, user_id: req.user_id, session_id, agent_id: session.agent_id,
+      state_before: session.state, registration_verified: session.registration_verified,
+      channel_id: session.channel_id,
+    }, '[DEBUG] go-ready received');
+
     if (!session.registration_verified || !session.channel_id) {
+      logger.warn({ session_id, registration_verified: session.registration_verified, channel_id: session.channel_id }, '[DEBUG] go-ready rejected: agent leg not live');
       return reply.status(409).send({
         error: 'Agent leg not yet confirmed. Wait for your phone to connect first.',
         code: 'AGENT_LEG_NOT_LIVE',
@@ -635,6 +647,7 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
     try {
       await ARI.channels.get(session.channel_id);
     } catch {
+      logger.warn({ session_id, channel_id: session.channel_id }, '[DEBUG] go-ready rejected: ARI channel dead');
       return reply.status(409).send({
         error: 'Agent channel is no longer active. Please re-arm your session.',
         code: 'AGENT_CHANNEL_DEAD',
@@ -643,9 +656,14 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
 
     try {
       const updated = await transitionAgentState(session_id, orgId, 'READY', { reason: 'go_ready' });
+      logger.info({
+        org_id: orgId, session_id, agent_id: updated.agent_id,
+        state_after: updated.state, campaign_id: updated.campaign_id,
+      }, '[DEBUG] go-ready success: session is now READY');
       return reply.send({ session: updated });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'State transition failed';
+      logger.error({ session_id, err }, '[DEBUG] go-ready transition failed');
       return reply.status(409).send({ error: msg });
     }
   });
@@ -709,7 +727,18 @@ export const dialerModule: FastifyPluginAsync = async (app) => {
 
     // 1. Require at least one READY agent session
     const readyAgents = await countReadyAgents(orgId, campaign_id);
+    logger.info({
+      org_id: orgId, user_id: req.user_id, campaign_id, ready_agent_count: readyAgents,
+    }, '[DEBUG] campaign start READY check');
     if (readyAgents === 0) {
+      // Dump open sessions for this org to show what state they are in
+      const { data: openSessions } = await supabase
+        .from('agent_sessions')
+        .select('session_id, agent_id, state, campaign_id, registration_verified, ended_at')
+        .eq('org_id', orgId)
+        .is('ended_at', null)
+        .limit(5);
+      logger.warn({ org_id: orgId, campaign_id, open_sessions: openSessions ?? [] }, '[DEBUG] NO_READY_AGENT: open sessions dump');
       return reply.status(409).send({
         error: 'No READY agent session found. Agent must be logged in and in READY state before starting the dialer.',
         code: 'NO_READY_AGENT',
