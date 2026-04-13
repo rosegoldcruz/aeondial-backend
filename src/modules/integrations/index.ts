@@ -3,7 +3,7 @@ import { supabase } from '../../core/supabase';
 
 export const integrationsModule: FastifyPluginAsync = async (app) => {
   app.get('/', async (req: any, reply) => {
-    const orgId = req.orgId as string;
+    const orgId = req.org_id as string;
     if (!orgId) return reply.status(401).send({ error: 'Missing org context' });
     const { data, error } = await supabase
       .from('integrations')
@@ -20,7 +20,7 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
   });
 
   app.post('/', async (req: any, reply) => {
-    const orgId = req.orgId as string;
+    const orgId = req.org_id as string;
     if (!orgId) return reply.status(401).send({ error: 'Missing org context' });
     const body = { ...(req.body as object), org_id: orgId };
     const { data, error } = await supabase
@@ -33,7 +33,7 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
   });
 
   app.patch('/:id', async (req: any, reply) => {
-    const orgId = req.orgId as string;
+    const orgId = req.org_id as string;
     if (!orgId) return reply.status(401).send({ error: 'Missing org context' });
     const { id } = req.params as { id: string };
     const { data, error } = await supabase
@@ -49,7 +49,7 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
   });
 
   app.delete('/:id', async (req: any, reply) => {
-    const orgId = req.orgId as string;
+    const orgId = req.org_id as string;
     if (!orgId) return reply.status(401).send({ error: 'Missing org context' });
     const { id } = req.params as { id: string };
     const { error } = await supabase
